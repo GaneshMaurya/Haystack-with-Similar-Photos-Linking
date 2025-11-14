@@ -1,0 +1,64 @@
+version: "3.8"
+services:
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "15672:15672"
+      - "5672:5672"
+
+  directory:
+    build: ./services/directory
+    ports: ["8001:8001"]
+    volumes:
+      - ./data/directory:/data
+    environment:
+      - DB_PATH=/data/directory.db
+
+  store1:
+    build: ./services/store
+    environment:
+      - STORE_ID=store1
+      - VOLUME_PATH=/data/volumes/volume_v1.dat
+    volumes:
+      - ./data/store1:/data
+    ports:
+      - "8101:8101"
+
+  store2:
+    build: ./services/store
+    environment:
+      - STORE_ID=store2
+      - VOLUME_PATH=/data/volumes/volume_v1.dat
+    volumes:
+      - ./data/store2:/data
+    ports:
+      - "8102:8101"
+
+  store3:
+    build: ./services/store
+    environment:
+      - STORE_ID=store3
+      - VOLUME_PATH=/data/volumes/volume_v1.dat
+    volumes:
+      - ./data/store3:/data
+    ports:
+      - "8103:8101"
+
+  api:
+    build: ./services/api
+    ports:
+      - "8080:8080"
+    environment:
+      - DIRECTORY_URL=http://directory:8001
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+    depends_on: ["directory", "store1", "rabbitmq"]
+
+  replicator:
+    build: ./services/replicator
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - DIRECTORY_URL=http://directory:8001
+    depends_on: ["rabbitmq", "directory", "store1", "store2", "store3"]
