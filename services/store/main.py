@@ -1,161 +1,227 @@
+"""
+Store service (manages one or more physical volumes).
+
+- Maintains an in-memory index: photo_id -> {offset, size, alt_key, deleted}
+- Persists index to JSON (index file) for quick restart.
+- Appends needles to a per-logical-volume file (haystack_lv_<lv>.dat).
+- Supports:
+  - POST /volume/{lv}/append  (headers: X-Photo-ID, X-Cookie, X-Alt-Key)
+  - GET  /volume/{lv}/read?photo_id=...
+  - GET  /volume/{lv}/exists?photo_id=...
+  - POST /volume/{lv}/delete (body: {"photo_id": ...})
+  - GET  /health
+"""
+
 import os
-from fastapi import FastAPI, Header, HTTPException, Request
+import json
+import hashlib
+from fastapi import FastAPI, Header, Request, HTTPException
 from fastapi.responses import Response
-from pydantic import BaseModel
-import pathlib, hashlib, json, uvicorn, logging
-from logging.handlers import RotatingFileHandler
-
-# Setup logging
-log_dir = os.path.dirname(os.path.abspath(__file__))
-log_file = os.path.join(log_dir, 'store.log')
-os.makedirs(log_dir, exist_ok=True)
-
-logger = logging.getLogger('store')
-logger.setLevel(logging.DEBUG)
-handler = RotatingFileHandler(log_file, maxBytes=10485760, backupCount=5)
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-logger.addHandler(handler)
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
+from typing import Dict
 
 app = FastAPI()
-STORE_ID = os.environ.get("STORE_ID", "store1")
-VOLUME_PATH = os.environ.get("VOLUME_PATH", "./data/volumes/volume_v1.dat")
-INDEX_PATH = VOLUME_PATH + ".idx"
 
-os.makedirs(os.path.dirname(VOLUME_PATH) or ".", exist_ok=True)
+STORE_ID = os.environ.get("STORE_ID", "store1")          # unique store node id
+DATA_DIR = os.environ.get("DATA_DIR", "./data")          # base dir for volumes/indexes
+os.makedirs(DATA_DIR, exist_ok=True)
 
-# in-memory index: photo_id -> {offset,size,checksum,deleted}
-index = {}
+# structure: index[logical_volume][photo_id] = {"offset": int, "size": int, "alt_key": str, "deleted": bool, "checksum": str}
+index: Dict[str, Dict[int, dict]] = {}
+# open file descriptors cache: files[logical_volume] = open file handle
+files: Dict[str, object] = {}
 
-# load index if exists
-if os.path.exists(INDEX_PATH):
-    try:
-        with open(INDEX_PATH, "r") as f:
-            index = json.load(f)
-            index = {int(k): v for k,v in index.items()}
-    except Exception:
-        index = {}
 
-def persist_index():
-    with open(INDEX_PATH, "w") as f:
-        json.dump({str(k): v for k,v in index.items()}, f)
+def index_path_for(lv: str) -> str:
+    return os.path.join(DATA_DIR, f"{lv}.idx.json")
 
-class DeleteReq(BaseModel):
-    photo_id: int
 
-@app.post("/volume/{vid}/append")
-async def append(vid: str, request: Request, x_photo_id: int = Header(None), x_cookie: str = Header(None)):
-    logger.info(f"Append request: volume={vid}, photo_id={x_photo_id}")
-    body = await request.body()
-    if x_photo_id is None:
-        logger.error(f"Append failed: X-Photo-ID header missing")
-        raise HTTPException(status_code=400, detail="X-Photo-ID required")
-    offset = os.path.getsize(VOLUME_PATH) if os.path.exists(VOLUME_PATH) else 0
-    logger.debug(f"Appending {len(body)} bytes at offset {offset}")
-    checksum = hashlib.sha256(body).hexdigest()
-    with open(VOLUME_PATH, "ab") as f:
-        header = json.dumps({"photo_id": x_photo_id, "cookie": x_cookie, "size": len(body)})
-        header_b = header.encode()
-        f.write(len(header_b).to_bytes(4, "big"))
-        f.write(header_b)
-        f.write(body)
-        f.write(checksum.encode())
-    index[x_photo_id] = {"offset": offset, "size": len(body), "checksum": checksum, "deleted": False}
-    persist_index()
-    logger.info(f"Photo appended successfully: photo_id={x_photo_id}, offset={offset}, size={len(body)}, checksum={checksum}")
-    return {"vid": vid, "offset": offset, "size": len(body), "checksum": checksum}
+def volume_path_for(lv: str) -> str:
+    # physical file for this logical volume on this store
+    return os.path.join(DATA_DIR, f"haystack_{lv}.dat")
 
-@app.get("/volume/{vid}/read")
-def read(vid: str, offset: int | None = None, photo_id: int | None = None):
-    logger.info(f"Read request: volume={vid}, photo_id={photo_id}, offset={offset}")
-    if photo_id is not None:
-        entry = index.get(photo_id)
-        if not entry or entry.get("deleted", False):
-            logger.warning(f"Read failed: Photo not found or deleted, photo_id={photo_id}")
-            raise HTTPException(status_code=404, detail="not found")
-        offset = entry["offset"]
-        size = entry["size"]
-        logger.debug(f"Found photo_id={photo_id} at offset={offset}, size={size}")
-    elif offset is not None:
-        logger.error(f"Read by offset unsupported: offset={offset}")
-        raise HTTPException(status_code=400, detail="read by offset unsupported in starter")
+
+def load_index(lv: str):
+    path = index_path_for(lv)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                index[lv] = {int(k): v for k, v in json.load(f).items()}
+        except Exception:
+            index[lv] = {}
     else:
-        logger.error(f"Read request missing both offset and photo_id")
-        raise HTTPException(status_code=400, detail="either offset or photo_id required")
-    try:
-        with open(VOLUME_PATH, "rb") as f:
-            f.seek(offset)
-            lbytes = f.read(4)
-            if len(lbytes) < 4:
-                logger.error(f"Read failed: Volume file corrupt at offset={offset}")
-                raise HTTPException(status_code=500, detail="corrupt")
-            header_len = int.from_bytes(lbytes, "big")
-            header = f.read(header_len)
-            header_json = json.loads(header.decode())
+        index[lv] = {}
+
+
+def persist_index(lv: str):
+    path = index_path_for(lv)
+    with open(path, "w") as f:
+        # convert keys to str for JSON
+        json.dump({str(k): v for k, v in index.get(lv, {}).items()}, f)
+
+
+def open_volume_file(lv: str):
+    # keep a single append-mode file descriptor per logical volume
+    if lv not in files:
+        path = volume_path_for(lv)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fh = open(path, "ab+")
+        files[lv] = fh
+    return files[lv]
+
+
+def rebuild_index_from_volume(lv: str):
+    """
+    Scan the haystack_<lv>.dat file and rebuild offsets and sizes.
+    Our framing format:
+      [4-byte header_len][header_json][data_bytes][32-byte checksum_hex]
+    header_json contains {"photo_id": int, "alt_key": str, "size": int, "cookie": str}
+    """
+    path = volume_path_for(lv)
+    idx = {}
+    if not os.path.exists(path):
+        index[lv] = {}
+        return
+    with open(path, "rb") as f:
+        offset = 0
+        while True:
+            # read header length
+            hlen_b = f.read(4)
+            if not hlen_b or len(hlen_b) < 4:
+                break
+            hlen = int.from_bytes(hlen_b, "big")
+            header_raw = f.read(hlen)
+            try:
+                header = json.loads(header_raw.decode())
+            except Exception:
+                # corrupt header -> stop
+                break
+            size = header.get("size")
+            photo_id = int(header.get("photo_id"))
+            alt_key = header.get("alt_key", "orig")
+            # read data
             data = f.read(size)
-            checksum = f.read(64)
-            if checksum.decode() != entry["checksum"]:
-                logger.error(f"Checksum mismatch for photo_id={photo_id}")
-                raise HTTPException(status_code=500, detail="checksum mismatch")
-            logger.info(f"Photo read successfully: photo_id={photo_id}, size={size}")
-            return Response(content=data, media_type="application/octet-stream")
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Read failed with exception: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+            checksum_raw = f.read(64)  # sha256 hex string length
+            checksum = checksum_raw.decode() if checksum_raw else None
+            # store in index
+            idx[photo_id] = {"offset": offset, "size": size, "alt_key": alt_key, "deleted": False, "checksum": checksum}
+            # advance offset
+            offset += 4 + hlen + size + (len(checksum_raw) if checksum_raw else 0)
+    index[lv] = idx
+    persist_index(lv)
 
-@app.get("/volume/{vid}/exists")
-def exists(vid: str, photo_id: int):
-    logger.debug(f"Exists check: volume={vid}, photo_id={photo_id}")
-    entry = index.get(photo_id)
-    if entry and not entry.get("deleted", False):
-        logger.debug(f"Photo exists: photo_id={photo_id}")
-        return {"exists": True, "offset": entry["offset"], "size": entry["size"], "checksum": entry["checksum"]}
-    logger.debug(f"Photo does not exist: photo_id={photo_id}")
-    return {"exists": False}
 
-@app.post("/volume/{vid}/delete")
-def mark_delete(vid: str, req: DeleteReq):
+@app.on_event("startup")
+def startup():
+    # for demo: load index for lv-1 only. In prod, you would load for every physical volume present.
+    # If you keep many volumes on the machine, iterate them.
+    default_lv = "lv-1"
+    load_index(default_lv)
+    # if index missing, try to rebuild from file
+    if not index.get(default_lv):
+        rebuild_index_from_volume(default_lv)
+
+
+@app.post("/volume/{lv}/append")
+async def append(lv: str, request: Request, x_photo_id: int = Header(None), x_cookie: str = Header(None), x_alt_key: str = Header("orig")):
     """
-    Mark a needle as deleted.
-    We do NOT remove bytes.
-    Only flip index flag and append a delete marker.
+    Append a needle to the logical volume on this Store.
+    - API must pass the Directory-assigned photo_id in X-Photo-ID
+    - We store header JSON + data + checksum and update in-memory index
     """
-    photo_id = req.photo_id
-    logger.info(f"Delete request: volume={vid}, photo_id={photo_id}")
+    if x_photo_id is None:
+        raise HTTPException(status_code=400, detail="X-Photo-ID header required")
 
-    if photo_id not in index:
-        logger.warning(f"Delete failed: Photo not found in index, photo_id={photo_id}")
+    data = await request.body()
+    size = len(data)
+    # framing
+    header = {"photo_id": int(x_photo_id), "alt_key": x_alt_key, "size": size, "cookie": x_cookie}
+    header_b = json.dumps(header).encode()
+    header_len = len(header_b)
+    checksum = hashlib.sha256(data).hexdigest()
+
+    fh = open_volume_file(lv)
+    # move to end for append
+    fh.seek(0, os.SEEK_END)
+    offset = fh.tell()
+    # write frame
+    fh.write(header_len.to_bytes(4, "big"))
+    fh.write(header_b)
+    fh.write(data)
+    fh.write(checksum.encode())
+    fh.flush()
+    # update index (in-memory) and persist
+    if lv not in index:
+        index[lv] = {}
+    index[lv][int(x_photo_id)] = {"offset": offset, "size": size, "alt_key": x_alt_key, "deleted": False, "checksum": checksum}
+    persist_index(lv)
+    return {"status": "stored", "lv": lv, "offset": offset, "size": size, "checksum": checksum}
+
+
+@app.get("/volume/{lv}/read")
+def read(lv: str, photo_id: int = None):
+    """
+    Read by photo_id. Store looks up in-memory index and seeks to offset.
+    """
+    if photo_id is None:
+        raise HTTPException(status_code=400, detail="photo_id required")
+    if lv not in index or photo_id not in index[lv]:
+        raise HTTPException(status_code=404, detail="not found")
+    entry = index[lv][photo_id]
+    if entry.get("deleted"):
+        raise HTTPException(status_code=410, detail="photo deleted")
+    offset = entry["offset"]
+    size = entry["size"]
+    path = volume_path_for(lv)
+    with open(path, "rb") as f:
+        f.seek(offset)
+        hlen_b = f.read(4)
+        if not hlen_b or len(hlen_b) < 4:
+            raise HTTPException(status_code=500, detail="corrupt volume")
+        hlen = int.from_bytes(hlen_b, "big")
+        header_raw = f.read(hlen)
+        # header parsed but not used here
+        _ = header_raw
+        data = f.read(size)
+        checksum_raw = f.read(64)
+        checksum = checksum_raw.decode() if checksum_raw else None
+        # optionally verify checksum
+        if checksum and checksum != entry.get("checksum"):
+            raise HTTPException(status_code=500, detail="checksum mismatch")
+        return Response(content=data, media_type="application/octet-stream")
+
+
+@app.get("/volume/{lv}/exists")
+def exists(lv: str, photo_id: int):
+    if lv not in index:
+        return {"exists": False}
+    entry = index[lv].get(int(photo_id))
+    if not entry:
+        return {"exists": False}
+    return {"exists": True, "offset": entry["offset"], "size": entry["size"], "deleted": entry["deleted"]}
+
+
+@app.post("/volume/{lv}/delete")
+def mark_delete(lv: str, payload: dict):
+    """
+    Soft delete on this store. Mark index entry deleted and append a delete marker in the file.
+    Compactor will reclaim space later.
+    """
+    photo_id = int(payload.get("photo_id"))
+    if lv not in index or photo_id not in index[lv]:
         return {"status": "not_found"}
-
-    # mark in-memory index
-    index[photo_id]["deleted"] = True
-    persist_index()
-    logger.debug(f"Marked photo as deleted in index: photo_id={photo_id}")
-
-    # append a delete record into volume file (optional, but Haystack does this)
-    try:
-        with open(VOLUME_PATH, "ab") as f:
-            marker = json.dumps({"delete": photo_id}).encode()
-            f.write(len(marker).to_bytes(4, "big"))
-            f.write(marker)
-        logger.debug(f"Appended delete marker to volume file: photo_id={photo_id}")
-    except Exception as e:
-        logger.error(f"Failed to append delete marker: {e}")
-        pass
-
-    logger.info(f"Photo successfully marked as deleted: photo_id={photo_id}")
+    index[lv][photo_id]["deleted"] = True
+    persist_index(lv)
+    # append delete marker for audit/compaction
+    fh = open_volume_file(lv)
+    fh.seek(0, os.SEEK_END)
+    marker = json.dumps({"delete": photo_id}).encode()
+    fh.write(len(marker).to_bytes(4, "big"))
+    fh.write(marker)
+    fh.flush()
     return {"status": "deleted", "photo_id": photo_id}
+
 
 @app.get("/health")
 def health():
-    logger.debug(f"Health check: store_id={STORE_ID}, num_index={len(index)}")
-    return {"store_id": STORE_ID, "volume": VOLUME_PATH, "num_index": len(index)}
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "8101"))
-    uvicorn.run(app, host="127.0.0.1", port=port)
+    totals = {lv: len(index.get(lv, {})) for lv in index}
+    return {"store_id": STORE_ID, "volumes": totals}
