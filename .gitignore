@@ -4,3 +4,5 @@ data/
 *.log
 *.jpg
 *.jpeg
+testdata/
+.pytest_cache/
