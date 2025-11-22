@@ -13,7 +13,8 @@ Directory instances:
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
-import services.directory.models as models
+# import services.directory.models as models
+import models
 import os
 import uvicorn
 

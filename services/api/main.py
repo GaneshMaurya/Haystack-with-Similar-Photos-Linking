@@ -39,7 +39,9 @@ def make_store_url(store_id: str):
         return f"http://{store_id}"
     port = _STORE_MAP.get(store_id)
     if port:
-        return f"http://localhost:{port}"
+        # WRONG: return f"http://localhost:{port}"
+        # CORRECT: Use the store_id (e.g., 'store1') as the hostname
+        return f"http://{store_id}:{port}" 
     return "http://localhost:8101"
 
 

@@ -9,6 +9,16 @@ services:
       - "15672:15672"
       - "5672:5672"
 
+  cache:
+    build: ./services/cache
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./data/cache:/data/cache
+    environment:
+      - CACHE_DATA_DIR=/data/cache
+      - MAX_CACHE_SIZE_BYTES=10485760
+
   directory:
     build: ./services/directory
     ports: ["8001:8001"]
@@ -54,11 +64,15 @@ services:
     environment:
       - DIRECTORY_URL=http://directory:8001
       - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
-    depends_on: ["directory", "store1", "rabbitmq"]
-
-  replicator:
-    build: ./services/replicator
-    environment:
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
-      - DIRECTORY_URL=http://directory:8001
-    depends_on: ["rabbitmq", "directory", "store1", "store2", "store3"]
+      - CACHE_URL=http://cache:8000
+      # ADD THIS LINE BELOW:
+      - STORE_PORTS=store1=8101,store2=8101,store3=8101
+    depends_on: ["directory", "store1", "rabbitmq", "cache"]
+  # I commented this out because you don't have a 'replicator' folder yet.
+  # If you create that folder later, you can uncomment this.
+  # replicator:
+  #   build: ./services/replicator
+  #   environment:
+  #     - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+  #     - DIRECTORY_URL=http://directory:8001
+  #   depends_on: ["rabbitmq", "directory", "store1", "store2", "store3"]
