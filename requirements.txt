@@ -1,0 +1,11 @@
+Pillow
+numpy
+faiss-cpu
+python-multipart
+torch
+torch-vision
+fastapi
+uvicorn[standard]
+httpx
+pika
+six

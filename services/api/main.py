@@ -1,6 +1,7 @@
 """
 Haystack-style API Gateway (client-facing). Implements:
 - POST /upload  -> allocate (Directory) -> append to ALL physical stores -> commit (Directory)
+- POST /find_similar -> Query Similarity Service
 - GET  /photo/{photo_id} -> Directory lookup -> Cache lookup -> Read from ANY replica
 - DELETE /photo/{photo_id} -> Directory mark deleted -> delete from ALL replicas -> delete from cache
 """
@@ -8,7 +9,7 @@ Haystack-style API Gateway (client-facing). Implements:
 import os
 import json
 import httpx
-from fastapi import FastAPI, File, UploadFile, HTTPException, Response
+from fastapi import FastAPI, File, UploadFile, HTTPException, Response, Form # Added 'Form'
 from typing import Optional
 import pika
 import logging
@@ -21,6 +22,7 @@ app = FastAPI()
 DIRECTORY_URL = os.environ.get("DIRECTORY_URL", "http://localhost:8001")
 
 CACHE_URL = os.environ.get("CACHE_URL", "http://localhost:8201")
+SIMILARITY_URL = os.environ.get("SIMILARITY_URL", "http://localhost:8301") # IMPORTANT: Ensure this is correctly set
 RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
 USE_RABBITMQ = os.environ.get("USE_RABBITMQ", "0") == "1"
 
@@ -124,8 +126,33 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
     if rc.status_code != 200:
         raise HTTPException(status_code=500,
                             detail=f"commit_write failed: {rc.text}")
+    
+    # 4) Upload to similarity Service
+    try:
+        async with httpx.AsyncClient() as client:
+            # Re-read file content if necessary, but since 'data' was read once above, 
+            # we can reuse it, but we need to reset the file cursor for the Similarity Service later 
+            # if we were to use the UploadFile object again.
+            
+            # Since 'data' holds the full content, we can use it directly.
+            form_data = {'photo_id': str(photo_id)}
+            file_data = {'file': (file.filename, data, file.content_type)}
+            
+            r_sim = await client.post(
+                f"{SIMILARITY_URL}/upload/", 
+                data=form_data, 
+                files=file_data, 
+                timeout=30.0
+            )
+            
+            if r_sim.status_code == 200:
+                logging.info(f"Successfully submitted photo {photo_id} to similarity service.")
+            else:
+                logging.warning(f"Similarity service returned status {r_sim.status_code} for photo {photo_id}. Response: {r_sim.text}")
+    except Exception as e:
+        logging.error(f"Failed to submit photo {photo_id} to similarity service: {e}")
 
-    # 4) Publish event (optional)
+    # 5) Publish event (optional)
     publish_event({
         "event": "photo.uploaded",
         "photo_id": photo_id,
@@ -134,6 +161,63 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
     })
 
     return {"photo_id": photo_id, "logical_volume": logical_volume}
+
+
+# ---------------- FIND SIMILAR -----------------
+
+@app.post("/find_similar")
+async def find_similar(file: UploadFile = File(...), k: int = Form(5)):
+    """
+    Forwards a query image to the similarity service and returns the top K similar photo IDs.
+    """
+    logging.info(f"Received similarity search request for file: {file.filename} with k={k}")
+
+    # 1. Read the file content for transmission
+    try:
+        content = await file.read()
+    except Exception as e:
+        logging.error(f"Failed to read content from query file: {e}")
+        raise HTTPException(status_code=500, detail="Failed to read query file content.")
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            
+            # 2. Define the form fields (k)
+            # k must be passed as a string in the form data, as expected by the Similarity Service
+            form_data = {'k': str(k)}
+
+            # 3. Define the file field
+            # The structure for files is: {'field_name': (filename, content, content_type)}
+            files = {
+                'file': (file.filename, content, file.content_type)
+            }
+            
+            # 4. Send the POST request to the Similarity Service
+            r_sim = await client.post(
+                f"{SIMILARITY_URL}/find_similar/",
+                data=form_data, 
+                files=files,
+                timeout=60.0 # Use a longer timeout for search
+            )
+            
+            # 5. Process the response
+            if r_sim.status_code == 200:
+                logging.info("Successfully received similar photos from similarity service.")
+                return r_sim.json()
+            else:
+                # Log the error and raise an appropriate HTTP exception
+                logging.error(f"Similarity service returned status {r_sim.status_code}. Response: {r_sim.text}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Similarity Service Error: {r_sim.status_code} - {r_sim.text[:100]}..."
+                )
+
+    except httpx.RequestError as e:
+        logging.error(f"Network error calling similarity service: {e}")
+        raise HTTPException(
+            status_code=503,
+            detail=f"Cannot reach similarity service: {e}"
+        )
 
 
 # ---------------- READ -----------------
@@ -243,4 +327,4 @@ async def delete_photo(photo_id: int):
 
 
 if __name__ == "__main__":
-    uvicorn.run("services.store.main:app", host="0.0.0.0", reload=False)
+    uvicorn.run("services.store.main:app", host="0.0.0.0")

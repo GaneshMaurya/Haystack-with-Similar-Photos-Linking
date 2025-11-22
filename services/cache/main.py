@@ -267,4 +267,4 @@ def health():
 
 if __name__ == "__main__":
     logger.info("Starting Cache server...")
-    uvicorn.run(app, host="0.0.0.0", reload=False)
+    uvicorn.run(app, host="0.0.0.0")
