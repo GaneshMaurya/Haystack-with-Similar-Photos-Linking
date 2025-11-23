@@ -1,21 +1,5 @@
 version: "3.8"
 services:
-# ... other services ...
-
-  similarity:
-    build: ./services/similarity
-    ports:
-      - "8005:8000"
-    volumes:
-      - ./data/similarity:/data
-    environment:
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
-      - API_URL=http://api:8080
-      - KMP_DUPLICATE_LIB_OK=TRUE
-      - OMP_NUM_THREADS=1
-    depends_on:
-      - rabbitmq
-      - api
   rabbitmq:
     image: rabbitmq:3-management
     environment:
@@ -88,11 +72,38 @@ services:
       - store1
       - rabbitmq
       - cache
-  # I commented this out because you don't have a 'replicator' folder yet.
-  # If you create that folder later, you can uncomment this.
-  # replicator:
-  #   build: ./services/replicator
-  #   environment:
-  #     - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
-  #     - DIRECTORY_URL=http://directory:8001
-  #   depends_on: ["rabbitmq", "directory", "store1", "store2", "store3"]
+
+  # --- SCALABLE SIMILARITY SERVICES ---
+
+  # 1. The MASTER (Holds Database & Serves Search)
+  similarity-master:
+    build: ./services/similarity
+    ports:
+      - "8005:8000"
+    volumes:
+      - ./data/similarity:/data
+    environment:
+      - SERVICE_MODE=MASTER
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - KMP_DUPLICATE_LIB_OK=TRUE
+      - OMP_NUM_THREADS=1
+    depends_on:
+      - rabbitmq
+
+  # 2. The WORKERS (Process Images - Scalable)
+  similarity-worker:
+    build: ./services/similarity
+    # No ports needed (they just listen to RabbitMQ)
+    volumes:
+      - ./data/similarity:/data
+    environment:
+      - SERVICE_MODE=WORKER
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - API_URL=http://api:8080
+      - KMP_DUPLICATE_LIB_OK=TRUE
+      - OMP_NUM_THREADS=1
+    deploy:
+      replicas: 3
+    depends_on:
+      - rabbitmq
+      - api
