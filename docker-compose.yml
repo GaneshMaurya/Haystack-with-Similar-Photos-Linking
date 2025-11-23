@@ -22,23 +22,25 @@ services:
     ports:
       - "8000:8000" # Expose the API Gateway port
     environment:
-      # Use internal Docker network names for service discovery
-      DIRECTORY_URL: http://directory_primary:8001
+      # DIRECTORY access is now through the Discovery Service (DS)
+      DISCOVERY_SERVICE_URL: http://discovery:8501
       CACHE_URL: http://cache:8201
       SIMILARITY_URL: http://similarity:8301
-      USE_RABBITMQ: "0" # Explicitly disabled (uses file logging)
+      USE_RABBITMQ: "0" # Disabled
+      # Store mapping uses internal service names/ports (no localhost)
       STORE_PORTS: "store1=store1:8101,store2=store2:8101,store3=store3:8101"
     networks:
       - haystack-net
     depends_on:
-      - directory_primary
+      - discovery
+      - directory_replica
+      - directory_replica_2
       - store1
       - store2
       - store3
       - cache
       - similarity
-    # We must explicitly tell Uvicorn the full path, which requires the working directory
-    # to be the project root where the 'services' folder lives.
+    # CMD using the fully qualified path
     command:
       [
         "uvicorn",
@@ -50,7 +52,34 @@ services:
       ]
 
   # ----------------------------------------------------
-  # 2. Directory Services (Primary & Replica)
+  # 2. Service Discovery (New Central Registry)
+  # ----------------------------------------------------
+  discovery:
+    build:
+      context: .
+      dockerfile: services/discovery/Dockerfile
+    image: haystack-discovery:latest
+    environment:
+      # Data file for persistence (inside shared volume)
+      DISCOVERY_FILE: data/discovery.json
+    ports:
+      - "8501:8501" # Host port for testing discovery directly
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data
+    command:
+      [
+        "uvicorn",
+        "services.discovery.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8501",
+      ]
+
+  # ----------------------------------------------------
+  # 3. Directory Services (Primary & Replica)
   # ----------------------------------------------------
   directory_primary:
     build:
@@ -59,14 +88,19 @@ services:
     image: haystack-directory:latest
     environment:
       DIRECTORY_MODE: primary
-      PRIMARY_DIRECTORY_URL: http://directory_primary:8001
+      DISCOVERY_SERVICE_URL: http://discovery:8501
       DB_PATH: data/directory.db
+      # Directory knows what stores are available for allocation
+      AVAILABLE_STORES: "store1,store2,store3"
+      HOSTNAME: directory_primary # Used by the app for registration
     ports:
       - "8001:8001"
     networks:
       - haystack-net
     volumes:
       - data-volume:/app/data
+    depends_on:
+      - discovery # Must wait for discovery service to be ready
     command:
       [
         "uvicorn",
@@ -84,12 +118,45 @@ services:
     image: haystack-directory:latest
     environment:
       DIRECTORY_MODE: replica
-      PRIMARY_DIRECTORY_URL: http://directory_primary:8001
+      DISCOVERY_SERVICE_URL: http://discovery:8501
       DB_PATH: data/directory.db
+      AVAILABLE_STORES: "store1,store2,store3"
+      HOSTNAME: directory_replica # Used by the app for registration
     networks:
       - haystack-net
     volumes:
       - data-volume:/app/data
+    depends_on:
+      - discovery
+    command:
+      [
+        "uvicorn",
+        "services.directory.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8001",
+      ]
+
+  directory_replica_2:
+    build:
+      context: .
+      dockerfile: services/directory/Dockerfile
+    image: haystack-directory:latest
+    environment:
+      DIRECTORY_MODE: replica
+      DISCOVERY_SERVICE_URL: http://discovery:8501
+      DB_PATH: data/directory.db
+      AVAILABLE_STORES: "store1,store2,store3"
+      HOSTNAME: directory_replica_2 # Unique Hostname
+    ports:
+      - "8003:8001" # Expose on a new host port (8003)
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data
+    depends_on:
+      - discovery
     command:
       [
         "uvicorn",
@@ -101,7 +168,7 @@ services:
       ]
 
   # ----------------------------------------------------
-  # 3. Store Services (Multiple Instances)
+  # 4. Store Services (Three Instances for 3-way replication)
   # ----------------------------------------------------
   store1:
     build:
@@ -176,7 +243,7 @@ services:
       ]
 
   # ----------------------------------------------------
-  # 4. Similarity Service (CPU Only, Path Fixed)
+  # 5. Similarity Service (CPU Only)
   # ----------------------------------------------------
   similarity:
     build:
@@ -191,7 +258,6 @@ services:
       - haystack-net
     volumes:
       - data-volume:/app/data
-    # FINAL FIX: Use the fully qualified path
     command:
       [
         "uvicorn",
@@ -203,7 +269,7 @@ services:
       ]
 
   # ----------------------------------------------------
-  # 5. Cache Service
+  # 6. Cache Service
   # ----------------------------------------------------
   cache:
     build:

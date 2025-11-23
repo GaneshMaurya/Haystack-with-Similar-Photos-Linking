@@ -1,52 +1,41 @@
-"""
-Haystack-style Store Service
----------------------------------------
-
-This Store node manages one or more **physical volumes**, each corresponding
-to a Haystack logical volume. Every Store maintains:
-
-- A per-volume needle file: data/haystack_<lv>.dat
-- A per-volume index file: data/<lv>.idx.json
-- An in-memory index: {photo_id → {offset, size, alt_key, deleted, checksum}}
-
-STORE BEHAVIOR:
----------------
-- API Gateway passes X-Photo-ID, X-Cookie, X-Alt-Key
-- Store appends:
-    [4-byte header_len][header_json][data][sha256 checksum hex]
-- Store computes offset locally (replicas have different offsets → OK)
-
-ENDPOINTS:
-----------
-POST /volume/{lv}/append
-GET  /volume/{lv}/read?photo_id=...
-POST /volume/{lv}/delete
-GET  /volume/{lv}/exists?photo_id=...
-GET  /health
-"""
-
 import os
 import json
 import hashlib
+import sys
 from fastapi import FastAPI, Header, Request, HTTPException
 from fastapi.responses import Response
 from typing import Dict
 import uvicorn
 import logging
-import os
 
 # Logging: write to console and a service-specific logfile under ./logs
 LOG_DIR = os.environ.get("LOG_DIR", "./logs")
 os.makedirs(LOG_DIR, exist_ok=True)
 STORE_LOG_FILE = os.path.join(LOG_DIR, "store.log")
 
-# Configure root logger only if not already configured
+# Configure root logger and remove existing handlers to avoid duplicates
 root_logger = logging.getLogger()
 root_logger.setLevel(logging.INFO)
-if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == os.path.abspath(STORE_LOG_FILE) for h in root_logger.handlers):
-    fh = logging.FileHandler(STORE_LOG_FILE)
-    fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s [STORE]: %(message)s'))
-    root_logger.addHandler(fh)
+for h in root_logger.handlers[:]:
+    root_logger.removeHandler(h)
+
+# File handler
+fh = logging.FileHandler(STORE_LOG_FILE)
+fh.setLevel(logging.INFO)
+fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s [STORE]: %(message)s'))
+root_logger.addHandler(fh)
+
+# Console handler
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.INFO)
+ch.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s [STORE]: %(message)s'))
+root_logger.addHandler(ch)
+
+logger = logging.getLogger(__name__)
+logger.info("=" * 60)
+logger.info("Store Service Starting")
+logger.info(f"Log file: {STORE_LOG_FILE}")
+logger.info("=" * 60)
 
 app = FastAPI()
 
@@ -57,6 +46,8 @@ app = FastAPI()
 STORE_ID = os.environ.get("STORE_ID", "store1")
 DATA_DIR = os.environ.get("DATA_DIR", "./data/store")
 os.makedirs(DATA_DIR, exist_ok=True)
+
+logger.info(f"STORE_ID={STORE_ID}, DATA_DIR={DATA_DIR}")
 
 # index[lv][photo_id] = {offset, size, alt_key, deleted, checksum}
 index: Dict[str, Dict[int, dict]] = {}
@@ -87,16 +78,23 @@ def load_index(lv: str):
         try:
             with open(path, "r") as f:
                 index[lv] = {int(k): v for k, v in json.load(f).items()}
-        except Exception:
+            logger.info(f"Loaded index for {lv} with {len(index[lv])} entries")
+        except Exception as e:
+            logger.error(f"Failed to load index for {lv}: {e}", exc_info=True)
             index[lv] = {}
     else:
         index[lv] = {}
+        logger.info(f"No existing index for {lv}; initialized empty index")
 
 
 def persist_index(lv: str):
     path = index_path_for(lv)
-    with open(path, "w") as f:
-        json.dump({str(k): v for k, v in index.get(lv, {}).items()}, f)
+    try:
+        with open(path, "w") as f:
+            json.dump({str(k): v for k, v in index.get(lv, {}).items()}, f)
+        logger.debug(f"Persisted index for {lv} ({len(index.get(lv, {}))} entries)")
+    except Exception as e:
+        logger.error(f"Failed to persist index for {lv}: {e}", exc_info=True)
 
 
 # ---------------------------------------
@@ -110,6 +108,7 @@ def open_volume_file(lv: str):
         os.makedirs(os.path.dirname(path), exist_ok=True)
         fh = open(path, "ab+")
         files[lv] = fh
+        logger.info(f"Opened volume file for {lv} at {path}")
     return files[lv]
 
 
@@ -125,45 +124,53 @@ def rebuild_index_from_volume(lv: str):
 
     if not os.path.exists(path):
         index[lv] = {}
+        logger.info(f"No volume file for {lv}; skipping rebuild")
         return
 
-    with open(path, "rb") as f:
-        offset = 0
-        while True:
-            hlen_b = f.read(4)
-            if not hlen_b or len(hlen_b) < 4:
-                break
+    logger.info(f"Rebuilding index for {lv} from volume file {path}")
+    try:
+        with open(path, "rb") as f:
+            offset = 0
+            while True:
+                hlen_b = f.read(4)
+                if not hlen_b or len(hlen_b) < 4:
+                    break
 
-            hlen = int.from_bytes(hlen_b, "big")
-            header_raw = f.read(hlen)
-            if not header_raw or len(header_raw) < hlen:
-                break
+                hlen = int.from_bytes(hlen_b, "big")
+                header_raw = f.read(hlen)
+                if not header_raw or len(header_raw) < hlen:
+                    break
 
-            try:
-                header = json.loads(header_raw.decode("utf-8"))
-            except Exception:
-                break
+                try:
+                    header = json.loads(header_raw.decode("utf-8"))
+                except Exception:
+                    break
 
-            photo_id = int(header["photo_id"])
-            size = header["size"]
-            alt_key = header.get("alt_key", "orig")
+                photo_id = int(header["photo_id"])
+                size = header["size"]
+                alt_key = header.get("alt_key", "orig")
 
-            data = f.read(size)
-            checksum_raw = f.read(64)   # 64-byte hex
-            checksum = checksum_raw.decode() if checksum_raw else None
+                data = f.read(size)
+                checksum_raw = f.read(64)   # 64-byte hex
+                checksum = checksum_raw.decode() if checksum_raw else None
 
-            idx[photo_id] = {
-                "offset": offset,
-                "size": size,
-                "alt_key": alt_key,
-                "deleted": False,
-                "checksum": checksum,
-            }
+                idx[photo_id] = {
+                    "offset": offset,
+                    "size": size,
+                    "alt_key": alt_key,
+                    "deleted": False,
+                    "checksum": checksum,
+                }
 
-            offset += 4 + hlen + size + (len(checksum_raw) if checksum_raw else 0)
+                offset += 4 + hlen + size + (len(checksum_raw) if checksum_raw else 0)
 
-    index[lv] = idx
-    persist_index(lv)
+        index[lv] = idx
+        persist_index(lv)
+        logger.info(f"Rebuild complete for {lv}; entries={len(idx)}")
+    except Exception as e:
+        logger.error(f"Error rebuilding index for {lv}: {e}", exc_info=True)
+        index[lv] = {}
+        persist_index(lv)
 
 
 # ---------------------------------------
@@ -178,6 +185,7 @@ def startup():
         # If empty index but file exists → rebuild
         if not index[default_lv]:
             rebuild_index_from_volume(default_lv)
+    logger.info("Store startup complete")
 
 
 # ---------------------------------------
@@ -192,7 +200,9 @@ async def append(
     x_cookie: str = Header(None),
     x_alt_key: str = Header("orig")
 ):
+    logger.info(f"[APPEND] lv={lv} photo_id={x_photo_id} alt_key={x_alt_key}")
     if x_photo_id is None:
+        logger.warning("[APPEND] Missing X-Photo-ID header")
         raise HTTPException(status_code=400, detail="Missing X-Photo-ID header")
 
     data = await request.body()
@@ -214,12 +224,16 @@ async def append(
     fh.seek(0, os.SEEK_END)
     offset = fh.tell()
 
-    # Write needle frame
-    fh.write(header_len.to_bytes(4, "big"))
-    fh.write(header_b)
-    fh.write(data)
-    fh.write(checksum.encode("utf-8"))
-    fh.flush()
+    try:
+        # Write needle frame
+        fh.write(header_len.to_bytes(4, "big"))
+        fh.write(header_b)
+        fh.write(data)
+        fh.write(checksum.encode("utf-8"))
+        fh.flush()
+    except Exception as e:
+        logger.error(f"[APPEND] Failed to write needle for photo {x_photo_id} to {lv}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="failed to write data")
 
     # Update in-memory index
     if lv not in index:
@@ -234,6 +248,7 @@ async def append(
     }
 
     persist_index(lv)
+    logger.info(f"[APPEND] Stored photo_id={x_photo_id} at offset={offset} size={size} checksum={checksum}")
 
     return {
         "status": "stored",
@@ -250,42 +265,55 @@ async def append(
 
 @app.get("/volume/{lv}/read")
 def read(lv: str, photo_id: int = None):
+    logger.info(f"[READ] lv={lv} photo_id={photo_id}")
     if photo_id is None:
+        logger.warning("[READ] photo_id missing in request")
         raise HTTPException(status_code=400, detail="photo_id required")
 
     photo_id = int(photo_id)
 
     if lv not in index or photo_id not in index[lv]:
+        logger.warning(f"[READ] photo_id={photo_id} not found in lv={lv}")
         raise HTTPException(status_code=404, detail="not found")
 
     entry = index[lv][photo_id]
     if entry["deleted"]:
+        logger.warning(f"[READ] photo_id={photo_id} marked deleted")
         raise HTTPException(status_code=410, detail="photo deleted")
 
     offset = entry["offset"]
     size = entry["size"]
 
     path = volume_path_for(lv)
-    with open(path, "rb") as f:
-        f.seek(offset)
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
 
-        # Read header len
-        hlen_b = f.read(4)
-        if len(hlen_b) < 4:
-            raise HTTPException(status_code=500, detail="corrupt volume")
+            # Read header len
+            hlen_b = f.read(4)
+            if len(hlen_b) < 4:
+                logger.error("[READ] corrupt volume (header len)")
+                raise HTTPException(status_code=500, detail="corrupt volume")
 
-        hlen = int.from_bytes(hlen_b, "big")
-        header_raw = f.read(hlen)
-        _ = header_raw  # parsed but unused
-        data = f.read(size)
-        checksum_raw = f.read(64)
-        checksum = checksum_raw.decode() if checksum_raw else None
+            hlen = int.from_bytes(hlen_b, "big")
+            header_raw = f.read(hlen)
+            _ = header_raw  # parsed but unused
+            data = f.read(size)
+            checksum_raw = f.read(64)
+            checksum = checksum_raw.decode() if checksum_raw else None
 
-        # Optional checksum verification
-        if checksum and checksum != entry["checksum"]:
-            raise HTTPException(status_code=500, detail="checksum mismatch")
+            # Optional checksum verification
+            if checksum and checksum != entry["checksum"]:
+                logger.error(f"[READ] checksum mismatch for photo {photo_id}")
+                raise HTTPException(status_code=500, detail="checksum mismatch")
 
-        return Response(content=data, media_type="application/octet-stream")
+            logger.info(f"[READ] Serving photo_id={photo_id} size={size}")
+            return Response(content=data, media_type="application/octet-stream")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[READ] Unexpected error while reading photo {photo_id} from {lv}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="read failed")
 
 
 # ---------------------------------------
@@ -294,6 +322,7 @@ def read(lv: str, photo_id: int = None):
 
 @app.get("/volume/{lv}/exists")
 def exists(lv: str, photo_id: int):
+    logger.debug(f"[EXISTS] lv={lv} photo_id={photo_id}")
     if lv not in index:
         return {"exists": False}
 
@@ -316,8 +345,10 @@ def exists(lv: str, photo_id: int):
 @app.post("/volume/{lv}/delete")
 def mark_delete(lv: str, payload: dict):
     photo_id = int(payload.get("photo_id"))
+    logger.info(f"[DELETE] lv={lv} photo_id={photo_id}")
 
     if lv not in index or photo_id not in index[lv]:
+        logger.warning(f"[DELETE] photo_id={photo_id} not found in lv={lv}")
         return {"status": "not_found"}
 
     index[lv][photo_id]["deleted"] = True
@@ -330,10 +361,14 @@ def mark_delete(lv: str, payload: dict):
     marker = {"delete": photo_id}
     marker_b = json.dumps(marker).encode("utf-8")
 
-    fh.write(len(marker_b).to_bytes(4, "big"))
-    fh.write(marker_b)
-    fh.flush()
+    try:
+        fh.write(len(marker_b).to_bytes(4, "big"))
+        fh.write(marker_b)
+        fh.flush()
+    except Exception as e:
+        logger.error(f"[DELETE] Failed to append delete marker for photo {photo_id}: {e}", exc_info=True)
 
+    logger.info(f"[DELETE] Marked photo_id={photo_id} as deleted")
     return {"status": "deleted", "photo_id": photo_id}
 
 
@@ -348,4 +383,6 @@ def health():
 
 
 if __name__ == "__main__":
-    uvicorn.run("services.store.main:app", host="0.0.0.0")
+    logger.info("Starting Store Service with Uvicorn")
+    port = int(os.environ.get("PORT", "8101"))
+    uvicorn.run("services.store.main:app", host="0.0.0.0", port=port)

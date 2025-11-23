@@ -1,4 +1,5 @@
 import os
+import sys
 import faiss
 import numpy as np
 import torch
@@ -13,8 +14,38 @@ import json
 import io
 
 # --- Logging Configuration ---
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+SIMILARITY_LOG_FILE = os.path.join(LOG_DIR, "similarity.log")
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Remove any existing handlers to avoid duplicates
+for h in root_logger.handlers[:]:
+    root_logger.removeHandler(h)
+
+# File handler
+file_handler = logging.FileHandler(SIMILARITY_LOG_FILE)
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('[SIMILARITY] %(asctime)s - %(levelname)s - %(name)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+root_logger.addHandler(file_handler)
+
+# Console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('[SIMILARITY] %(asctime)s - %(levelname)s - %(name)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+root_logger.addHandler(console_handler)
+
 logger = logging.getLogger(__name__)
+logger.info("=" * 60)
+logger.info("Image Similarity Service Starting")
+logger.info(f"Log file: {SIMILARITY_LOG_FILE}")
+logger.info("=" * 60)
+# ...existing code...
 
 # --- FastAPI App Initialization ---
 app = FastAPI(title="Image Similarity Service")
@@ -69,7 +100,7 @@ def get_image_embedding(image_bytes: bytes): # MODIFIED: Accepts bytes instead o
         logger.debug("Embedding generated and normalized.")
         return embedding_np.astype('float32')
     except Exception as e:
-        logger.error(f"Failed to generate embedding: {e}")
+        logger.error(f"Failed to generate embedding: {e}", exc_info=True)
         raise
 
 # --- FAISS Indexing ---
@@ -89,9 +120,9 @@ if os.path.exists(INDEX_FILE):
         # Removed image_list loading
         with open(MAPPING_FILE, "r") as f: 
             photo_id_to_embedding_id = json.load(f)
-        logger.info(f"Loaded {index.ntotal} vectors and {len(photo_id_to_embedding_id)} image paths. Index type: {type(index).__name__}")
+        logger.info(f"Loaded {index.ntotal} vectors and {len(photo_id_to_embedding_id)} image mappings. Index type: {type(index).__name__}")
     except Exception as e:
-        logger.error(f"Failed to load existing index or mapping: {e}. Starting fresh.")
+        logger.error(f"Failed to load existing index or mapping: {e}. Starting fresh.", exc_info=True)
         index = faiss.IndexFlatIP(embedding_dim)
         photo_id_to_embedding_id = {}
 else:
@@ -109,7 +140,7 @@ async def upload_image(file: UploadFile = File(...), photo_id: str = Form(...)):
     try:
         image_bytes = await file.read()
     except Exception as e:
-        logger.error(f"Failed to read uploaded file: {e}")
+        logger.error(f"Failed to read uploaded file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Could not read uploaded file content.")
 
     # Generate and add embedding to index
@@ -121,11 +152,11 @@ async def upload_image(file: UploadFile = File(...), photo_id: str = Form(...)):
         
         # Store the photo_id to embedding_id mapping
         embedding_id = index.ntotal - 1  # FAISS adds to the end, so it's the last index
-        photo_id_to_embedding_id[photo_id] = embedding_id
+        photo_id_to_embedding_id[photo_id] = int(embedding_id)
         # Removed image_list append
         logger.info(f"Added new embedding for photo_id '{photo_id}'. Total items in index: {index.ntotal}")
     except Exception as e:
-        logger.error(f"Failed during embedding or indexing for '{file.filename}' (photo_id: '{photo_id}'): {e}")
+        logger.error(f"Failed during embedding or indexing for '{file.filename}' (photo_id: '{photo_id}'): {e}", exc_info=True)
         # No need to clean up file on disk
         raise HTTPException(status_code=500, detail="Failed to process image and update index.")
 
@@ -137,7 +168,7 @@ async def upload_image(file: UploadFile = File(...), photo_id: str = Form(...)):
             json.dump(photo_id_to_embedding_id, f)
         logger.info(f"Successfully saved index to '{INDEX_FILE}' and photo_id mapping.")
     except Exception as e:
-        logger.error(f"Failed to persist index or photo_id mapping to disk: {e}")
+        logger.error(f"Failed to persist index or photo_id mapping to disk: {e}", exc_info=True)
         
     return {"message": f"Image '{file.filename}' (photo_id: '{photo_id}') uploaded and indexed successfully."}
 
@@ -155,7 +186,7 @@ async def find_similar_images(file: UploadFile = File(...), k: int = Form(5)):
     try:
         query_bytes = await file.read()
     except Exception as e:
-        logger.error(f"Failed to read query file: {e}")
+        logger.error(f"Failed to read query file: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Could not read query file content.")
         
     # Generate normalized embedding for the query image
@@ -163,7 +194,7 @@ async def find_similar_images(file: UploadFile = File(...), k: int = Form(5)):
         query_embedding = get_image_embedding(query_bytes) # MODIFIED: Pass bytes
         logger.info("Generated normalized embedding for query image.")
     except Exception as e:
-        logger.error(f"Could not generate embedding for query image: {e}")
+        logger.error(f"Could not generate embedding for query image: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Could not generate embedding for query image.")
 
     # Search for k + 10 neighbors to filter out potential duplicates/self-matches
@@ -210,4 +241,5 @@ async def find_similar_images(file: UploadFile = File(...), k: int = Form(5)):
 
 if __name__ == "__main__":
     logger.info("Starting Image Similarity Service with Uvicorn...")
-    uvicorn.run(app, host="0.0.0.0")
+    port = int(os.environ.get("PORT", "8301"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_config=None)
