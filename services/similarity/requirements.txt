@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+httpx
+pydantic
+faiss-cpu
+torch
+torchvision
+numpy
+Pillow
+python-multipart

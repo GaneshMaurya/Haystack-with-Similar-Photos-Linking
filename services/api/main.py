@@ -14,8 +14,20 @@ from typing import Optional
 import pika
 import logging
 import uvicorn
+import os
 
-logging.basicConfig(level=logging.INFO)
+# Logging: write to console and a service-specific logfile under ./logs
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+API_LOG_FILE = os.path.join(LOG_DIR, "api.log")
+
+# Configure root logger only if not already configured
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == os.path.abspath(API_LOG_FILE) for h in root_logger.handlers):
+    fh = logging.FileHandler(API_LOG_FILE)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s: %(message)s'))
+    root_logger.addHandler(fh)
 app = FastAPI()
 
 # Single entrypoint for all Directory operations (LB behind)
@@ -36,13 +48,26 @@ for kv in filter(None, _STORE_MAP_RAW.split(",")):
 
 
 def make_store_url(store_id: str):
-    """Convert store id into a localhost:port URL."""
+    """
+    Converts store ID to the correct URL (using Docker network name in containers).
+    
+    If 'port' is defined (e.g., 'store1:8101' in Docker Compose), we use that entire
+    string as the network address. Otherwise, we assume local host port mapping.
+    """
     if ":" in store_id:
         return f"http://{store_id}"
-    port = _STORE_MAP.get(store_id)
-    if port:
-        return f"http://localhost:{port}"
-    return "http://localhost:8101"
+    
+    port_or_address = _STORE_MAP.get(store_id)
+    
+    if port_or_address:
+        # If the environment variable provided a network address (e.g., 'store1:8101'), 
+        # use the whole address prefixed by http://
+        if ':' in port_or_address:
+             return f"http://{port_or_address}"
+        # If it only provided a port (e.g., '8101' in local testing), use localhost.
+        return f"http://localhost:{port_or_address}"
+        
+    return "http://localhost:8101" # Default fallback
 
 
 # ---------------- Publish Event -----------------
@@ -107,11 +132,17 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
                     timeout=30.0
                 )
             if r2.status_code != 200:
+                # LOGGING ADDED: Store returned a non-200 HTTP error
+                logging.error(f"Store {store} failed. Status: {r2.status_code}. Response: {r2.text}") 
                 failed.append(store)
-        except Exception:
+        except Exception as e:
+            # LOGGING ADDED: Network error (e.g., connection refused, timeout)
+            logging.error(f"Network error or exception occurred with store {store}: {e}") 
             failed.append(store)
 
     if failed:
+        # Log the overall failure reason
+        logging.error(f"Upload aborted because append failed on stores: {failed}")
         # Remove bad replicas from Directory?
         # For now: abort upload entirely (Haystack usually marks them disabled)
         raise HTTPException(status_code=500,
@@ -130,10 +161,6 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
     # 4) Upload to similarity Service
     try:
         async with httpx.AsyncClient() as client:
-            # Re-read file content if necessary, but since 'data' was read once above, 
-            # we can reuse it, but we need to reset the file cursor for the Similarity Service later 
-            # if we were to use the UploadFile object again.
-            
             # Since 'data' holds the full content, we can use it directly.
             form_data = {'photo_id': str(photo_id)}
             file_data = {'file': (file.filename, data, file.content_type)}

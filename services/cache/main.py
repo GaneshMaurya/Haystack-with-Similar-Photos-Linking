@@ -32,10 +32,20 @@ import uvicorn
 # Logging
 # ------------------------------------------
 
-logging.basicConfig(
-    level=logging.INFO,
-    format='[CACHE] %(asctime)s - %(levelname)s - %(message)s'
-)
+import os
+
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+CACHE_LOG_FILE = os.path.join(LOG_DIR, "cache.log")
+
+# Configure root logger only if not already configured
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == os.path.abspath(CACHE_LOG_FILE) for h in root_logger.handlers):
+    fh = logging.FileHandler(CACHE_LOG_FILE)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s [CACHE]: %(message)s'))
+    root_logger.addHandler(fh)
+
 logger = logging.getLogger("haystack-cache")
 
 # ------------------------------------------

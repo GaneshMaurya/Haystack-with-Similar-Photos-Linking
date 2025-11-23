@@ -1,64 +1,230 @@
 version: "3.8"
+
+# Define a shared network for service communication
+networks:
+  haystack-net:
+    driver: bridge
+
+# Define volumes for persistent data (FAISS index, SQLite DB, Store data, Cache data)
+volumes:
+  data-volume:
+    driver: local
+
 services:
-  rabbitmq:
-    image: rabbitmq:3-management
-    environment:
-      RABBITMQ_DEFAULT_USER: guest
-      RABBITMQ_DEFAULT_PASS: guest
+  # ----------------------------------------------------
+  # 1. API Gateway (Entry Point)
+  # ----------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    image: haystack-api:latest
     ports:
-      - "15672:15672"
-      - "5672:5672"
-
-  directory:
-    build: ./services/directory
-    ports: ["8001:8001"]
-    volumes:
-      - ./data/directory:/data
+      - "8000:8000" # Expose the API Gateway port
     environment:
-      - DB_PATH=/data/directory.db
+      # Use internal Docker network names for service discovery
+      DIRECTORY_URL: http://directory_primary:8001
+      CACHE_URL: http://cache:8201
+      SIMILARITY_URL: http://similarity:8301
+      USE_RABBITMQ: "0" # Explicitly disabled (uses file logging)
+      STORE_PORTS: "store1=store1:8101,store2=store2:8101,store3=store3:8101"
+    networks:
+      - haystack-net
+    depends_on:
+      - directory_primary
+      - store1
+      - store2
+      - store3
+      - cache
+      - similarity
+    # We must explicitly tell Uvicorn the full path, which requires the working directory
+    # to be the project root where the 'services' folder lives.
+    command:
+      [
+        "uvicorn",
+        "services.api.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
 
+  # ----------------------------------------------------
+  # 2. Directory Services (Primary & Replica)
+  # ----------------------------------------------------
+  directory_primary:
+    build:
+      context: .
+      dockerfile: services/directory/Dockerfile
+    image: haystack-directory:latest
+    environment:
+      DIRECTORY_MODE: primary
+      PRIMARY_DIRECTORY_URL: http://directory_primary:8001
+      DB_PATH: data/directory.db
+    ports:
+      - "8001:8001"
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data
+    command:
+      [
+        "uvicorn",
+        "services.directory.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8001",
+      ]
+
+  directory_replica:
+    build:
+      context: .
+      dockerfile: services/directory/Dockerfile
+    image: haystack-directory:latest
+    environment:
+      DIRECTORY_MODE: replica
+      PRIMARY_DIRECTORY_URL: http://directory_primary:8001
+      DB_PATH: data/directory.db
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data
+    command:
+      [
+        "uvicorn",
+        "services.directory.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8001",
+      ]
+
+  # ----------------------------------------------------
+  # 3. Store Services (Multiple Instances)
+  # ----------------------------------------------------
   store1:
-    build: ./services/store
+    build:
+      context: .
+      dockerfile: services/store/Dockerfile
+    image: haystack-store:latest
     environment:
-      - STORE_ID=store1
-      - VOLUME_PATH=/data/volumes/volume_v1.dat
-    volumes:
-      - ./data/store1:/data
+      STORE_ID: store1
+      DATA_DIR: /app/data/store1_data
     ports:
       - "8101:8101"
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data/store1_data
+    command:
+      [
+        "uvicorn",
+        "services.store.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8101",
+      ]
 
   store2:
-    build: ./services/store
+    build:
+      context: .
+      dockerfile: services/store/Dockerfile
+    image: haystack-store:latest
     environment:
-      - STORE_ID=store2
-      - VOLUME_PATH=/data/volumes/volume_v1.dat
-    volumes:
-      - ./data/store2:/data
+      STORE_ID: store2
+      DATA_DIR: /app/data/store2_data
     ports:
-      - "8102:8101"
+      - "8102:8101" # Host 8102 -> Container 8101
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data/store2_data
+    command:
+      [
+        "uvicorn",
+        "services.store.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8101",
+      ]
 
   store3:
-    build: ./services/store
+    build:
+      context: .
+      dockerfile: services/store/Dockerfile
+    image: haystack-store:latest
     environment:
-      - STORE_ID=store3
-      - VOLUME_PATH=/data/volumes/volume_v1.dat
+      STORE_ID: store3
+      DATA_DIR: /app/data/store3_data
+    ports:
+      - "8103:8101" # Host 8103 -> Container 8101
+    networks:
+      - haystack-net
     volumes:
-      - ./data/store3:/data
-    ports:
-      - "8103:8101"
+      - data-volume:/app/data/store3_data
+    command:
+      [
+        "uvicorn",
+        "services.store.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8101",
+      ]
 
-  api:
-    build: ./services/api
+  # ----------------------------------------------------
+  # 4. Similarity Service (CPU Only, Path Fixed)
+  # ----------------------------------------------------
+  similarity:
+    build:
+      context: .
+      dockerfile: services/similarity/Dockerfile
+    image: haystack-similarity:latest
     ports:
-      - "8080:8080"
+      - "8301:8301"
     environment:
-      - DIRECTORY_URL=http://directory:8001
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
-    depends_on: ["directory", "store1", "rabbitmq"]
+      DATA_BASE_DIR: /app/data
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data
+    # FINAL FIX: Use the fully qualified path
+    command:
+      [
+        "uvicorn",
+        "services.similarity.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8301",
+      ]
 
-  replicator:
-    build: ./services/replicator
+  # ----------------------------------------------------
+  # 5. Cache Service
+  # ----------------------------------------------------
+  cache:
+    build:
+      context: .
+      dockerfile: services/cache/Dockerfile
+    image: haystack-cache:latest
     environment:
-      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
-      - DIRECTORY_URL=http://directory:8001
-    depends_on: ["rabbitmq", "directory", "store1", "store2", "store3"]
+      CACHE_DATA_DIR: /app/data/cache_data
+      MAX_CACHE_SIZE_BYTES: 50000000
+    ports:
+      - "8201:8201"
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data/cache_data
+    command:
+      [
+        "uvicorn",
+        "services.cache.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8201",
+      ]

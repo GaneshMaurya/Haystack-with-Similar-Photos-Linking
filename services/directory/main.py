@@ -13,9 +13,23 @@ Directory instances:
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
-import services.directory.models as models
+import models as models
 import os
 import uvicorn
+import logging
+
+# Logging: write to console and a service-specific logfile under ./logs
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+DIRECTORY_LOG_FILE = os.path.join(LOG_DIR, "directory.log")
+
+# Configure root logger only if not already configured
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == os.path.abspath(DIRECTORY_LOG_FILE) for h in root_logger.handlers):
+    fh = logging.FileHandler(DIRECTORY_LOG_FILE)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s [DIRECTORY]: %(message)s'))
+    root_logger.addHandler(fh)
 
 app = FastAPI()
 

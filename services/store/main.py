@@ -32,6 +32,21 @@ from fastapi import FastAPI, Header, Request, HTTPException
 from fastapi.responses import Response
 from typing import Dict
 import uvicorn
+import logging
+import os
+
+# Logging: write to console and a service-specific logfile under ./logs
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+STORE_LOG_FILE = os.path.join(LOG_DIR, "store.log")
+
+# Configure root logger only if not already configured
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == os.path.abspath(STORE_LOG_FILE) for h in root_logger.handlers):
+    fh = logging.FileHandler(STORE_LOG_FILE)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s [STORE]: %(message)s'))
+    root_logger.addHandler(fh)
 
 app = FastAPI()
 
