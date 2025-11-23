@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pika
+httpx
+numpy<2       # <--- THIS IS THE CRITICAL FIX
+pillow
+torch
+torchvision
+faiss-cpu

@@ -1,0 +1,1876 @@
+PROJECT EXPORT
+Root: C:\Users\Saich\OneDrive\Desktop\Sai_Haystack\Haystack-with-Similar-Photos-Linking
+================================================================================
+
+FILE PATH: .gitignore
+--------------------------------------------------------------------------------
+venv/
+__pycache__/
+data/
+*.log
+*.jpg
+*.jpeg
+testdata/
+.pytest_cache/
+================================================================================
+
+FILE PATH: docker-compose.yml
+--------------------------------------------------------------------------------
+version: "3.8"
+services:
+# ... other services ...
+
+  similarity:
+    build: ./services/similarity
+    ports:
+      - "8005:8000"
+    volumes:
+      - ./data/similarity:/data
+    environment:
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - API_URL=http://api:8080
+      - KMP_DUPLICATE_LIB_OK=TRUE
+      - OMP_NUM_THREADS=1
+    depends_on:
+      - rabbitmq
+      - api
+  rabbitmq:
+    image: rabbitmq:3-management
+    environment:
+      RABBITMQ_DEFAULT_USER: guest
+      RABBITMQ_DEFAULT_PASS: guest
+    ports:
+      - "15672:15672"
+      - "5672:5672"
+
+  cache:
+    build: ./services/cache
+    ports:
+      - "8002:8000"
+    volumes:
+      - ./data/cache:/data/cache
+    environment:
+      - CACHE_DATA_DIR=/data/cache
+      - MAX_CACHE_SIZE_BYTES=10485760
+
+  directory:
+    build: ./services/directory
+    ports: ["8001:8001"]
+    volumes:
+      - ./data/directory:/data
+    environment:
+      - DB_PATH=/data/directory.db
+
+  store1:
+    build: ./services/store
+    environment:
+      - STORE_ID=store1
+      - VOLUME_PATH=/data/volumes/volume_v1.dat
+    volumes:
+      - ./data/store1:/data
+    ports:
+      - "8101:8101"
+
+  store2:
+    build: ./services/store
+    environment:
+      - STORE_ID=store2
+      - VOLUME_PATH=/data/volumes/volume_v1.dat
+    volumes:
+      - ./data/store2:/data
+    ports:
+      - "8102:8101"
+
+  store3:
+    build: ./services/store
+    environment:
+      - STORE_ID=store3
+      - VOLUME_PATH=/data/volumes/volume_v1.dat
+    volumes:
+      - ./data/store3:/data
+    ports:
+      - "8103:8101"
+
+  api:
+    build: ./services/api
+    ports:
+      - "8080:8080"
+    environment:
+      - DIRECTORY_URL=http://directory:8001
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - CACHE_URL=http://cache:8000
+      # ADD THIS LINE BELOW:
+      - STORE_PORTS=store1=8101,store2=8101,store3=8101
+    depends_on: ["directory", "store1", "rabbitmq", "cache"]
+  # I commented this out because you don't have a 'replicator' folder yet.
+  # If you create that folder later, you can uncomment this.
+  # replicator:
+  #   build: ./services/replicator
+  #   environment:
+  #     - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+  #     - DIRECTORY_URL=http://directory:8001
+  #   depends_on: ["rabbitmq", "directory", "store1", "store2", "store3"]
+================================================================================
+
+FILE PATH: README.md
+--------------------------------------------------------------------------------
+# Haystack-with-Similar-Photos-Linking
+================================================================================
+
+FILE PATH: services\api\Dockerfile
+--------------------------------------------------------------------------------
+FROM python:3.10-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8080"]
+
+================================================================================
+
+FILE PATH: services\api\main.py
+--------------------------------------------------------------------------------
+"""
+Haystack-style API Gateway (client-facing). Implements:
+- POST /upload  -> allocate (Directory) -> append to ALL physical stores -> commit (Directory)
+- GET  /photo/{photo_id} -> Directory lookup -> Cache lookup -> Read from ANY replica
+- DELETE /photo/{photo_id} -> Directory mark deleted -> delete from ALL replicas -> delete from cache
+"""
+
+import os
+import json
+import httpx
+from fastapi import FastAPI, File, UploadFile, HTTPException, Response
+from typing import Optional
+import pika
+import logging
+import uvicorn
+
+logging.basicConfig(level=logging.INFO)
+app = FastAPI()
+
+# Single entrypoint for all Directory operations (LB behind)
+DIRECTORY_URL = os.environ.get("DIRECTORY_URL", "http://localhost:8001")
+
+CACHE_URL = os.environ.get("CACHE_URL", "http://localhost:8201")
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+USE_RABBITMQ = os.environ.get("USE_RABBITMQ", "0") == "1"
+
+# STORE_ID -> PORT mapping
+_STORE_MAP_RAW = os.environ.get("STORE_PORTS", "store1=8101,store2=8102,store3=8103")
+_STORE_MAP = {}
+for kv in filter(None, _STORE_MAP_RAW.split(",")):
+    if "=" in kv:
+        k, v = kv.split("=", 1)
+        _STORE_MAP[k.strip()] = v.strip()
+
+
+def make_store_url(store_id: str):
+    """Convert store id into a localhost:port URL."""
+    if ":" in store_id:
+        return f"http://{store_id}"
+    port = _STORE_MAP.get(store_id)
+    if port:
+        # WRONG: return f"http://localhost:{port}"
+        # CORRECT: Use the store_id (e.g., 'store1') as the hostname
+        return f"http://{store_id}:{port}" 
+    return "http://localhost:8101"
+
+
+# ---------------- Publish Event -----------------
+
+def publish_event(payload: dict):
+    if not USE_RABBITMQ:
+        os.makedirs("./data", exist_ok=True)
+        with open("./data/events.log", "a") as f:
+            f.write(json.dumps(payload) + "\n")
+        return
+    try:
+        params = pika.URLParameters(RABBITMQ_URL)
+        conn = pika.BlockingConnection(params)
+        ch = conn.channel()
+        ch.exchange_declare(exchange='photo.events', exchange_type='topic', durable=True)
+        ch.basic_publish(
+            exchange='photo.events',
+            routing_key='photo.uploaded',
+            body=json.dumps(payload),
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+        conn.close()
+    except Exception:
+        logging.exception("failed to publish event")
+
+
+# ---------------- UPLOAD (Haystack-style) -----------------
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
+    data = await file.read()
+    size = len(data)
+
+    # 1) allocate from Directory
+    async with httpx.AsyncClient() as client:
+        r = await client.post(f"{DIRECTORY_URL}/allocate_write",
+                              json={"size": size, "alt_key": alt_key},
+                              timeout=10.0)
+    if r.status_code != 200:
+        raise HTTPException(status_code=500, detail=f"allocate_write failed: {r.text}")
+
+    alloc = r.json()
+    photo_id = alloc["photo_id"]
+    logical_volume = alloc["logical_volume"]
+    cookie = alloc["cookie"]
+    replicas = alloc["replicas"]    # IMPORTANT: list of ALL physical stores
+
+    headers = {"X-Photo-ID": str(photo_id),
+               "X-Cookie": cookie,
+               "X-Alt-Key": alt_key}
+
+    # 2) Append synchronously to ALL stores (Haystack behavior)
+    failed = []
+    for store in replicas:
+        store_url = make_store_url(store)
+        try:
+            async with httpx.AsyncClient() as sclient:
+                r2 = await sclient.post(
+                    f"{store_url}/volume/{logical_volume}/append",
+                    content=data,
+                    headers=headers,
+                    timeout=30.0
+                )
+            if r2.status_code != 200:
+                failed.append(store)
+        except Exception:
+            failed.append(store)
+
+    if failed:
+        # Remove bad replicas from Directory?
+        # For now: abort upload entirely (Haystack usually marks them disabled)
+        raise HTTPException(status_code=500,
+                            detail=f"append failed on: {failed}")
+
+    # 3) Commit write in Directory
+    async with httpx.AsyncClient() as client:
+        rc = await client.post(f"{DIRECTORY_URL}/commit_write",
+                               json={"photo_id": photo_id},
+                               timeout=5.0)
+
+    if rc.status_code != 200:
+        raise HTTPException(status_code=500,
+                            detail=f"commit_write failed: {rc.text}")
+
+    # 4) Publish event (optional)
+    publish_event({
+        "event": "photo.uploaded",
+        "photo_id": photo_id,
+        "logical_volume": logical_volume,
+        "replicas": replicas
+    })
+
+    return {"photo_id": photo_id, "logical_volume": logical_volume}
+
+
+# ---------------- READ -----------------
+
+@app.get("/photo/{photo_id}")
+async def serve_photo(photo_id: int):
+    # 1) Lookup metadata from Directory
+    async with httpx.AsyncClient() as client:
+        r = await client.get(f"{DIRECTORY_URL}/photo/{photo_id}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=404, detail="photo not found")
+
+    meta = r.json()
+    if meta["status"] != "active":
+        raise HTTPException(status_code=410, detail="photo deleted")
+
+    logical_volume = meta["logical_volume"]
+    replicas = meta["replicas"]
+
+    # 2) Cache lookup
+    async with httpx.AsyncClient() as client:
+        try:
+            cresp = await client.get(f"{CACHE_URL}/cache/photo/{photo_id}", timeout=5.0)
+            if cresp.status_code == 200:
+                return Response(content=cresp.content,
+                                media_type="application/octet-stream")
+        except:
+            pass
+
+    # 3) Cache miss → Try Store replicas
+    for store in replicas:
+        store_url = make_store_url(store)
+        try:
+            async with httpx.AsyncClient() as sclient:
+                resp = await sclient.get(
+                    f"{store_url}/volume/{logical_volume}/read",
+                    params={"photo_id": photo_id},
+                    timeout=10.0
+                )
+        except:
+            continue
+
+        if resp.status_code == 200:
+            # store in cache
+            async with httpx.AsyncClient() as cclient:
+                try:
+                    await cclient.post(
+                        f"{CACHE_URL}/cache/photo/{photo_id}",
+                        content=resp.content,
+                        timeout=5.0
+                    )
+                except:
+                    pass
+
+            return Response(content=resp.content,
+                            media_type="application/octet-stream")
+
+    raise HTTPException(status_code=503, detail="all replicas failed")
+
+
+# ---------------- DELETE -----------------
+
+@app.delete("/photo/{photo_id}")
+async def delete_photo(photo_id: int):
+
+    # 1) Directory lookup
+    async with httpx.AsyncClient() as dclient:
+        r = await dclient.get(f"{DIRECTORY_URL}/photo/{photo_id}")
+    if r.status_code != 200:
+        raise HTTPException(status_code=404, detail="photo not found")
+
+    meta = r.json()
+    logical_volume = meta["logical_volume"]
+    replicas = meta["replicas"]
+
+    # 2) Mark deleted in Directory
+    async with httpx.AsyncClient() as pclient:
+        rd = await pclient.post(f"{DIRECTORY_URL}/delete",
+                                json={"photo_id": photo_id})
+    if rd.status_code != 200:
+        raise HTTPException(status_code=500, detail="directory delete failed")
+
+    # 3) Delete on ALL stores
+    failed = []
+    for store in replicas:
+        store_url = make_store_url(store)
+        try:
+            async with httpx.AsyncClient() as sclient:
+                r2 = await sclient.post(
+                    f"{store_url}/volume/{logical_volume}/delete",
+                    json={"photo_id": photo_id},
+                    timeout=5.0
+                )
+            if r2.status_code != 200:
+                failed.append(store)
+        except:
+            failed.append(store)
+
+    # 4) Purge cache
+    try:
+        async with httpx.AsyncClient() as cclient:
+            await cclient.delete(f"{CACHE_URL}/cache/photo/{photo_id}", timeout=3.0)
+    except:
+        pass
+
+    return {"status": "deleted", "failed_replicas": failed}
+
+
+if __name__ == "__main__":
+    uvicorn.run("services.store.main:app", host="0.0.0.0", reload=False)
+
+================================================================================
+
+FILE PATH: services\api\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn[standard]
+httpx
+pika
+python-multipart
+
+================================================================================
+
+FILE PATH: services\cache\Dockerfile
+--------------------------------------------------------------------------------
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy the app code
+COPY . .
+
+# Define the volume for cache data so it persists
+VOLUME /data/cache
+
+# Expose the default Uvicorn port
+EXPOSE 8000
+
+# Run the app
+CMD ["python", "main.py"]
+================================================================================
+
+FILE PATH: services\cache\main.py
+--------------------------------------------------------------------------------
+"""
+Haystack Cache Service
+----------------------
+
+This Cache stores raw photo bytes identified by photo_id.
+Cache semantics match Haystack-style caching:
+- Cache stores recently-read or recently-uploaded items.
+- Does NOT store offsets or anything Haystack-specific.
+- TTL + LRU eviction + size limit.
+- Cache is best-effort. Failures MUST NOT break the system.
+
+Endpoints:
+    GET    /cache/exists/{photo_id}
+    GET    /cache/photo/{photo_id}
+    POST   /cache/photo/{photo_id}
+    DELETE /cache/photo/{photo_id}
+    GET    /cache/stats
+    GET    /health
+"""
+
+import os
+import time
+import json
+import asyncio
+import logging
+from typing import Dict
+from collections import OrderedDict
+from fastapi import FastAPI, HTTPException, Request, Response
+import uvicorn
+
+# ------------------------------------------
+# Logging
+# ------------------------------------------
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='[CACHE] %(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger("haystack-cache")
+
+# ------------------------------------------
+# Configuration
+# ------------------------------------------
+
+DATA_DIR = os.environ.get("CACHE_DATA_DIR", "./data/cache")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+MAX_CACHE_SIZE_BYTES = int(os.environ.get("MAX_CACHE_SIZE_BYTES", 10 * 1024 * 1024))  # 10 MB
+MAX_ITEMS = int(os.environ.get("MAX_CACHE_ITEMS", 20))
+TTL_SEC = int(os.environ.get("CACHE_TTL_SEC", 60))
+SWEEP_INTERVAL = int(os.environ.get("CACHE_SWEEP_SEC", 10))
+
+logger.info(f"Cache dir={DATA_DIR}, max_bytes={MAX_CACHE_SIZE_BYTES}, max_items={MAX_ITEMS}, ttl={TTL_SEC}")
+
+# ------------------------------------------
+# In-memory Cache: OrderedDict = LRU
+# ------------------------------------------
+
+cache_index: "OrderedDict[int, dict]" = OrderedDict()
+total_cache_bytes = 0
+
+# ------------------------------------------
+# Helpers
+# ------------------------------------------
+
+def now():
+    return time.time()
+
+def file_path(photo_id: int):
+    return os.path.join(DATA_DIR, f"{photo_id}.bin")
+
+def is_expired(meta):
+    return meta["expiry"] < now()
+
+def touch(photo_id: int):
+    """Refresh TTL and move to MRU."""
+    try:
+        meta = cache_index.pop(photo_id)
+        meta["last_access"] = now()
+        meta["expiry"] = now() + TTL_SEC
+        cache_index[photo_id] = meta
+        return True
+    except KeyError:
+        return False
+
+def remove_from_cache(photo_id: int):
+    """Remove metadata and file."""
+    global total_cache_bytes
+
+    meta = cache_index.pop(photo_id, None)
+    if meta:
+        total_cache_bytes -= meta["size"]
+
+    path = file_path(photo_id)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+def evict_if_needed():
+    """Evict expired items first, then LRU/size-based."""
+    global total_cache_bytes
+
+    evicted = []
+
+    # 1) Expired eviction
+    for pid in list(cache_index.keys()):
+        meta = cache_index.get(pid)
+        if meta and is_expired(meta):
+            remove_from_cache(pid)
+            evicted.append(pid)
+
+    # 2) Size or count eviction
+    while total_cache_bytes > MAX_CACHE_SIZE_BYTES or len(cache_index) > MAX_ITEMS:
+        if not cache_index:
+            break
+        pid, _ = cache_index.popitem(last=False)  # LRU eviction
+        remove_from_cache(pid)
+        evicted.append(pid)
+
+    return evicted
+
+# ------------------------------------------
+# Background Sweeper
+# ------------------------------------------
+
+async def sweep_loop():
+    logger.info("Cache sweep loop started.")
+    while True:
+        try:
+            evicted = evict_if_needed()
+            if evicted:
+                logger.info(f"Swept {len(evicted)} items: {evicted}")
+        except Exception as e:
+            logger.exception(f"Error during sweep: {e}")
+        await asyncio.sleep(SWEEP_INTERVAL)
+
+# ------------------------------------------
+# Startup & Shutdown
+# ------------------------------------------
+
+app = FastAPI(title="Haystack Cache")
+
+@app.on_event("startup")
+async def startup():
+    logger.info("Cache service starting...")
+    app.state.sweeper = asyncio.create_task(sweep_loop())
+
+@app.on_event("shutdown")
+async def shutdown():
+    logger.info("Stopping cache service...")
+    sweeper = getattr(app.state, "sweeper", None)
+    if sweeper:
+        sweeper.cancel()
+        try:
+            await sweeper
+        except asyncio.CancelledError:
+            pass
+
+# ------------------------------------------
+# API Endpoints
+# ------------------------------------------
+
+@app.get("/cache/exists/{photo_id}")
+def exists(photo_id: int):
+    meta = cache_index.get(photo_id)
+    if not meta:
+        return {"exists": False}
+    if is_expired(meta):
+        remove_from_cache(photo_id)
+        return {"exists": False}
+    return {"exists": True, "size": meta["size"]}
+
+@app.get("/cache/photo/{photo_id}")
+def get_photo(photo_id: int):
+    meta = cache_index.get(photo_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="cache miss")
+
+    if is_expired(meta):
+        remove_from_cache(photo_id)
+        raise HTTPException(status_code=404, detail="expired")
+
+    # refresh TTL + move to MRU
+    touch(photo_id)
+
+    path = meta["path"]
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        return Response(content=data, media_type="application/octet-stream")
+    except Exception:
+        remove_from_cache(photo_id)
+        raise HTTPException(status_code=404, detail="file missing")
+
+@app.post("/cache/photo/{photo_id}")
+async def put_photo(photo_id: int, request: Request):
+    global total_cache_bytes
+
+    body = await request.body()
+    size = len(body)
+
+    if size == 0:
+        raise HTTPException(status_code=400, detail="empty body")
+
+    path = file_path(photo_id)
+    tmp = path + ".tmp"
+
+    # atomic write
+    try:
+        with open(tmp, "wb") as f:
+            f.write(body)
+        os.replace(tmp, path)
+    except Exception as e:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise HTTPException(status_code=500, detail=f"write failed: {e}")
+
+    # update in-memory index
+    old = cache_index.pop(photo_id, None)
+    if old:
+        total_cache_bytes -= old["size"]
+
+    meta = {
+        "path": path,
+        "size": size,
+        "last_access": now(),
+        "expiry": now() + TTL_SEC
+    }
+    cache_index[photo_id] = meta
+    total_cache_bytes += size
+
+    # enforce eviction
+    evict_if_needed()
+
+    return {"status": "stored", "photo_id": photo_id, "size": size}
+
+@app.delete("/cache/photo/{photo_id}")
+def delete_photo(photo_id: int):
+    if photo_id not in cache_index:
+        # best-effort: still attempt file removal
+        path = file_path(photo_id)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except:
+                pass
+        return {"status": "not_found"}
+
+    remove_from_cache(photo_id)
+    return {"status": "deleted", "photo_id": photo_id}
+
+@app.get("/cache/stats")
+def stats():
+    return {
+        "items": len(cache_index),
+        "bytes": total_cache_bytes,
+        "max_bytes": MAX_CACHE_SIZE_BYTES,
+        "max_items": MAX_ITEMS,
+        "ttl": TTL_SEC
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "items": len(cache_index)}
+
+if __name__ == "__main__":
+    logger.info("Starting Cache server...")
+    uvicorn.run(app, host="0.0.0.0", reload=False)
+
+================================================================================
+
+FILE PATH: services\cache\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn[standard]
+pydantic
+
+================================================================================
+
+FILE PATH: services\directory\Dockerfile
+--------------------------------------------------------------------------------
+FROM python:3.10-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001"]
+
+================================================================================
+
+FILE PATH: services\directory\main.py
+--------------------------------------------------------------------------------
+"""
+Haystack-style Directory FastAPI app.
+
+Directory instances:
+- Share the same DB
+- One instance is primary (leader)
+- Others are replicas (followers)
+- Only primary handles writes
+- Replicas redirect writes to primary
+- Reads may be served by any instance
+"""
+
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+# import services.directory.models as models
+import models
+import os
+import uvicorn
+
+app = FastAPI()
+
+# Initialize DB on startup
+models.init_db()
+
+# NEW: Directory mode (primary or replica)
+DIRECTORY_MODE = os.environ.get("DIRECTORY_MODE", "primary")  # "primary" or "replica"
+PRIMARY_DIRECTORY_URL = os.environ.get("PRIMARY_DIRECTORY_URL", "http://localhost:8001")
+
+print(f"[Directory] Starting in mode: {DIRECTORY_MODE}")
+print(f"[Directory] Primary URL is: {PRIMARY_DIRECTORY_URL}")
+
+# -----------------------
+# Request Models
+# -----------------------
+
+class AllocateReq(BaseModel):
+    size: int
+    alt_key: str | None = "orig"
+
+
+# We remove primary_store (Haystack uploads to ALL replicas)
+class AllocateResp(BaseModel):
+    photo_id: int
+    logical_volume: str
+    cookie: str
+    replicas: list[str]
+
+
+class CommitReq(BaseModel):
+    photo_id: int
+
+
+class DeleteReq(BaseModel):
+    photo_id: int
+
+
+# -----------------------
+# Helper: Redirect if not primary
+# -----------------------
+
+def ensure_primary():
+    if DIRECTORY_MODE != "primary":
+        # Redirect this write request to the real primary
+        raise HTTPException(
+            status_code=307,
+            detail=f"Redirect to primary",
+            headers={"Location": PRIMARY_DIRECTORY_URL}
+        )
+
+
+# -----------------------
+# WRITE Endpoints (Primary Only)
+# -----------------------
+
+@app.post("/allocate_write", response_model=AllocateResp)
+def allocate(req: AllocateReq):
+    # If replica, redirect
+    ensure_primary()
+
+    try:
+        r = models.allocate_write(req.size, req.alt_key or "orig")
+        # Must return: photo_id, logical_volume, cookie, replicas[]
+        return {
+            "photo_id": r["photo_id"],
+            "logical_volume": r["logical_volume"],
+            "cookie": r["cookie"],
+            "replicas": r["replicas"]
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/commit_write")
+def commit(req: CommitReq):
+    ensure_primary()
+
+    try:
+        return models.commit_write(req.photo_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/delete")
+def delete(req: DeleteReq):
+    ensure_primary()
+
+    try:
+        return models.mark_deleted(req.photo_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------
+# READ Endpoints (Primary or Replica)
+# -----------------------
+
+@app.get("/photo/{photo_id}")
+def get_photo(photo_id: int):
+    """Followers can serve this normally."""
+    p = models.get_photo(photo_id)
+    if not p:
+        raise HTTPException(status_code=404, detail="photo not found")
+    return p
+
+
+@app.get("/photos")
+def list_photos():
+    return models.list_all_photos()
+
+
+@app.get("/health")
+def health():
+    db_path = os.environ.get("DB_PATH", "data/directory.db")
+    return {
+        "service": "directory",
+        "mode": DIRECTORY_MODE,
+        "db_path": db_path,
+        "db_exists": os.path.exists(db_path),
+        "primary_directory": PRIMARY_DIRECTORY_URL
+    }
+
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("PORT", "8001")))
+
+================================================================================
+
+FILE PATH: services\directory\models.py
+--------------------------------------------------------------------------------
+"""
+Directory models and DB helpers (Haystack-style).
+
+Directory stores *only logical metadata*:
+- photo_id -> logical_volume, alt_key, cookie, status, replicas
+
+Directory does NOT track offsets/sizes — Stores do.
+
+Flow:
+1. allocate_write(): choose a writable logical volume, create photo row in 'alloc' state.
+2. commit_write(): mark row active.
+3. get_photo(): return logical metadata.
+4. mark_deleted(): soft-delete a photo.
+"""
+
+import sqlite3
+from contextlib import closing
+import os
+import json
+import logging
+from typing import List
+
+logging.basicConfig(level=logging.INFO)
+
+DB = os.environ.get("DB_PATH", "data/directory.db")
+
+
+# --------------------------------------------
+# INITIALIZATION
+# --------------------------------------------
+
+def init_db():
+    os.makedirs(os.path.dirname(DB) or ".", exist_ok=True)
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+
+        # Logical volumes: maps an LV to a set of physical store nodes
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS volumes (
+            logical_volume TEXT PRIMARY KEY,
+            replicas TEXT NOT NULL,
+            capacity_bytes INTEGER DEFAULT 1000000000,
+            used_bytes INTEGER DEFAULT 0,
+            is_writable INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'active',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        # Photos: pure logical metadata (no offsets/sizes)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS photos (
+            photo_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            logical_volume TEXT NOT NULL,
+            alt_key TEXT DEFAULT 'orig',
+            cookie TEXT,
+            replicas TEXT,
+            status TEXT DEFAULT 'alloc',  -- alloc -> pending append, active -> OK, deleted
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        # Optional table: can remove since we use synchronous replication
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS replication_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_id INTEGER NOT NULL,
+            replica_node TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        # Insert a default logical volume (for development)
+        c.execute("INSERT OR IGNORE INTO volumes (logical_volume, replicas) VALUES (?, ?)",
+                  ("lv-1", "store1,store2,store3"))
+
+        # Migration safety for alt_key
+        c.execute("PRAGMA table_info(photos)")
+        cols = [r[1] for r in c.fetchall()]
+        if "alt_key" not in cols:
+            logging.info("Adding alt_key column to photos")
+            c.execute("ALTER TABLE photos ADD COLUMN alt_key TEXT DEFAULT 'orig'")
+
+        conn.commit()
+
+
+# --------------------------------------------
+# INTERNAL HELPERS
+# --------------------------------------------
+
+def choose_volume_for_write(size: int) -> dict:
+    """
+    Select a writable logical volume. For now, first writable LV.
+    Real Haystack uses free space, load, allocation policy, etc.
+    """
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            SELECT logical_volume, replicas
+            FROM volumes
+            WHERE is_writable = 1
+            LIMIT 1
+        """)
+        row = c.fetchone()
+        if not row:
+            raise RuntimeError("No writable logical volume available")
+
+        logical_volume, replicas = row
+        return {
+            "logical_volume": logical_volume,
+            "replicas": replicas.split(",")
+        }
+
+
+# --------------------------------------------
+# WRITE: allocate_write
+# --------------------------------------------
+
+def allocate_write(size: int, alt_key: str = "orig") -> dict:
+    """
+    Main Haystack-style directory allocation:
+    - choose logical volume
+    - assign new photo_id
+    - generate cookie
+    - return ALL replicas (Store nodes)
+    """
+
+    from uuid import uuid4
+    cookie = uuid4().hex[:16]
+
+    vol = choose_volume_for_write(size)
+    logical_volume = vol["logical_volume"]
+    replicas = vol["replicas"]
+
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO photos (logical_volume, alt_key, cookie, replicas, status)
+            VALUES (?, ?, ?, ?, ?)
+        """, (logical_volume, alt_key, cookie, ",".join(replicas), "alloc"))
+
+        photo_id = c.lastrowid
+        conn.commit()
+
+    # Return EXACT fields expected by API Gateway
+    return {
+        "photo_id": photo_id,
+        "logical_volume": logical_volume,
+        "cookie": cookie,
+        "replicas": replicas
+    }
+
+
+# --------------------------------------------
+# WRITE: commit_write
+# --------------------------------------------
+
+def commit_write(photo_id: int):
+    """
+    After Stores append successfully, mark photo as active.
+    """
+
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+
+        c.execute("SELECT status FROM photos WHERE photo_id = ?", (photo_id,))
+        row = c.fetchone()
+        if not row:
+            raise RuntimeError("photo_id not found")
+
+        c.execute("UPDATE photos SET status = 'active' WHERE photo_id = ?", (photo_id,))
+        conn.commit()
+
+    return {"status": "committed", "photo_id": photo_id}
+
+
+# --------------------------------------------
+# READ: get_photo
+# --------------------------------------------
+
+def get_photo(photo_id: int) -> dict | None:
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+
+        c.execute("""
+            SELECT photo_id, logical_volume, alt_key, cookie, replicas, status
+            FROM photos
+            WHERE photo_id = ?
+        """, (photo_id,))
+
+        row = c.fetchone()
+        if not row:
+            return None
+
+        return {
+            "photo_id": row[0],
+            "logical_volume": row[1],
+            "alt_key": row[2],
+            "cookie": row[3],
+            "replicas": row[4].split(",") if row[4] else [],
+            "status": row[5]
+        }
+
+
+# --------------------------------------------
+# WRITE: mark_deleted
+# --------------------------------------------
+
+def mark_deleted(photo_id: int):
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+
+        c.execute("SELECT status FROM photos WHERE photo_id = ?", (photo_id,))
+        if not c.fetchone():
+            raise RuntimeError("photo not found")
+
+        c.execute("""
+            UPDATE photos
+            SET status = 'deleted'
+            WHERE photo_id = ?
+        """, (photo_id,))
+
+        conn.commit()
+
+    return {"status": "deleted", "photo_id": photo_id}
+
+
+# --------------------------------------------
+# DEBUG helper
+# --------------------------------------------
+
+def list_all_photos() -> dict:
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT photo_id, logical_volume, alt_key, status FROM photos")
+        rows = c.fetchall()
+
+        return {
+            "total": len(rows),
+            "photos": [
+                {
+                    "photo_id": r[0],
+                    "logical_volume": r[1],
+                    "alt_key": r[2],
+                    "status": r[3]
+                }
+                for r in rows
+            ]
+        }
+
+================================================================================
+
+FILE PATH: services\directory\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn[standard]
+pydantic
+requests
+
+================================================================================
+
+FILE PATH: services\similarity\Dockerfile
+--------------------------------------------------------------------------------
+FROM python:3.9-slim
+
+WORKDIR /app
+
+# Fix: Use 'libgl1' instead of 'libgl1-mesa-glx'
+RUN apt-get update && apt-get install -y \
+    libgl1 \
+    libglib2.0-0 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+# Install torch cpu version specifically to keep image size smaller
+RUN pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
+
+COPY . .
+
+# Create directory for FAISS index and downloaded images
+RUN mkdir -p /data/similarity_images
+
+EXPOSE 8000
+
+CMD ["python", "main.py"]
+================================================================================
+
+FILE PATH: services\similarity\feature_extractor.py
+--------------------------------------------------------------------------------
+import torch
+from torchvision.models import vit_b_16, ViT_B_16_Weights
+from torchvision import transforms
+from PIL import Image
+import numpy as np
+from typing import Optional
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ImageFeatureExtractor:
+    def __init__(self, device: Optional[str] = None):
+        if device is None:
+            self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        else:
+            self.device = device
+            
+        logger.info(f"Using device: {self.device}")
+        
+        # Initialize ViT model
+        self.model = vit_b_16(weights=ViT_B_16_Weights.IMAGENET1K_V1)
+        
+        # Modify forward pass to get embeddings
+        self.original_forward = self.model.forward
+        self.model.forward = self._forward_features
+        
+        self.model.eval()
+        self.model.to(self.device)
+        
+        self.feature_dim = 768  # Fixed for ViT-B/16
+        
+        self.transform = transforms.Compose([
+            transforms.Resize(224),
+            transforms.CenterCrop(224),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                               std=[0.229, 0.224, 0.225])
+        ])
+
+    def _forward_features(self, x):
+        x = self.model._process_input(x)
+        n = x.shape[0]
+        cls_token = self.model.class_token.expand(n, -1, -1)
+        x = torch.cat([cls_token, x], dim=1)
+        x = self.model.encoder(x)
+        return x[:, 0]
+
+    @torch.no_grad()
+    def extract_features(self, image_path: str) -> np.ndarray:
+        try:
+            image = Image.open(image_path).convert('RGB')
+            image = self.transform(image).unsqueeze(0).to(self.device)
+            features = self.model(image)
+            features = features.cpu().numpy().squeeze()
+            
+            # L2 Normalize
+            norm = np.linalg.norm(features)
+            if norm > 0:
+                features = features / norm
+            
+            # CRITICAL FIX: Cast to float32 to prevent FAISS crash
+            return features.astype(np.float32)
+        except Exception as e:
+            logger.error(f"Error extracting features from {image_path}: {str(e)}")
+            raise
+================================================================================
+
+FILE PATH: services\similarity\main.py
+--------------------------------------------------------------------------------
+import os
+import json
+import asyncio
+import threading
+import logging
+import pika
+import httpx
+import uvicorn
+from fastapi import FastAPI, HTTPException
+from retrieval_system import ImageRetrievalSystem
+
+# --- Configuration ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("similarity-service")
+
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
+API_URL = os.environ.get("API_URL", "http://api:8080")
+DATA_DIR = "/data/similarity_images"
+INDEX_PATH = "/data/faiss.index"
+META_PATH = "/data/faiss_meta.json"
+
+# Ensure data dir exists
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# --- Initialize System ---
+# We initialize the system you wrote. 
+# We use n_regions=1 for simplicity if dataset is small initially, 
+# or keep your default 100 if you expect many photos.
+similarity_system = ImageRetrievalSystem(
+    index_path=INDEX_PATH,
+    metadata_path=META_PATH,
+    use_gpu=False,
+    n_regions=5  # Lower regions for small test data
+)
+
+# If index doesn't exist, we might need to "train" it with dummy data 
+# or handle the first batch carefully. Your code handles "not trained" checks.
+
+app = FastAPI()
+
+# --- RabbitMQ Consumer (Background Thread) ---
+def download_image(photo_id):
+    """Downloads image from the Main API/Store to local disk for processing"""
+    local_path = os.path.join(DATA_DIR, f"{photo_id}.jpg")
+    
+    # If we already have it, skip download
+    if os.path.exists(local_path):
+        return local_path
+
+    try:
+        # We call the Main API to get the photo bytes
+        with httpx.Client() as client:
+            resp = client.get(f"{API_URL}/photo/{photo_id}", timeout=30.0)
+            if resp.status_code == 200:
+                with open(local_path, "wb") as f:
+                    f.write(resp.content)
+                return local_path
+            else:
+                logger.error(f"Failed to download photo {photo_id}: {resp.status_code}")
+                return None
+    except Exception as e:
+        logger.error(f"Exception downloading photo {photo_id}: {e}")
+        return None
+
+def callback(ch, method, properties, body):
+    try:
+        event = json.loads(body)
+        logger.info(f"Received event: {event}")
+
+        if event.get("event") == "photo.uploaded":
+            photo_id = event.get("photo_id")
+            
+            # 1. Download image to local storage
+            image_path = download_image(photo_id)
+            
+            if image_path:
+                # 2. Auto-Train if needed (FAISS IVF needs training on first few images)
+                if not similarity_system.is_trained:
+                    logger.info("Index not trained. Training on single image (not optimal but functional for demo)...")
+                    # Hack: For IVF index, we need a batch to train. 
+                    # If we are adding one by one, we might need IndexFlatL2 (Brute force) instead of IVF 
+                    # OR we force training on this one image.
+                    # Ideally, your index_images logic handles batch, but here we do single.
+                    # Let's re-use your batch logic for this single file to force training.
+                    similarity_system.index_images(DATA_DIR)
+                else:
+                    # 3. Add to Index using your code
+                    similarity_system.add_single_image(image_path, str(photo_id))
+                
+                logger.info(f"Successfully indexed photo {photo_id}")
+
+        ch.basic_ack(delivery_tag=method.delivery_tag)
+    except Exception as e:
+        logger.error(f"Error processing message: {e}")
+        ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+def start_consumer():
+    try:
+        params = pika.URLParameters(RABBITMQ_URL)
+        connection = pika.BlockingConnection(params)
+        channel = connection.channel()
+        
+        channel.exchange_declare(exchange='photo.events', exchange_type='topic', durable=True)
+        result = channel.queue_declare(queue='similarity_queue', durable=True)
+        queue_name = result.method.queue
+        
+        channel.queue_bind(exchange='photo.events', queue=queue_name, routing_key='photo.uploaded')
+        
+        logger.info("Similarity Consumer started...")
+        channel.basic_consume(queue=queue_name, on_message_callback=callback)
+        channel.start_consuming()
+    except Exception as e:
+        logger.error(f"Consumer connection failed: {e}")
+
+# Start consumer in background thread
+consumer_thread = threading.Thread(target=start_consumer, daemon=True)
+consumer_thread.start()
+
+# --- API Endpoints ---
+
+@app.get("/similar/{photo_id}")
+def get_similar_photos(photo_id: str, k: int = 5):
+    """
+    1. Finds the path of the requested photo_id (must be indexed).
+    2. Searches for K nearest neighbors.
+    """
+    # Find local path from metadata
+    query_path = similarity_system.find_path_by_id(photo_id)
+    
+    if not query_path:
+        # If not in metadata, maybe we have the file but not indexed?
+        # Try to download it just in case it's a new query
+        query_path = download_image(photo_id)
+        if not query_path:
+             raise HTTPException(status_code=404, detail="Photo not found in index or store")
+
+    try:
+        results = similarity_system.search(query_path, k=k)
+        # Filter out the query photo itself (distance 0.0)
+        results = [r for r in results if str(r['photo_id']) != str(photo_id)]
+        return {"photo_id": photo_id, "similar": results}
+    except RuntimeError as e:
+         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "trained": similarity_system.is_trained, "total_indexed": similarity_system.index.ntotal if similarity_system.is_trained else 0}
+
+if __name__ == "__main__":
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+================================================================================
+
+FILE PATH: services\similarity\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn
+pika
+httpx
+numpy<2       # <--- THIS IS THE CRITICAL FIX
+pillow
+torch
+torchvision
+faiss-cpu
+================================================================================
+
+FILE PATH: services\similarity\retrieval_system.py
+--------------------------------------------------------------------------------
+import os
+import json
+import faiss
+import numpy as np
+from datetime import datetime
+import logging
+from typing import List, Tuple, Optional
+# FIX: Correct import for Docker environment
+from feature_extractor import ImageFeatureExtractor
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ImageRetrievalSystem:
+    def __init__(self, 
+                 index_path: Optional[str] = None,
+                 metadata_path: Optional[str] = None,
+                 use_gpu: bool = False,
+                 n_regions: int = 100,
+                 nprobe: int = 10):
+        
+        self.feature_extractor = ImageFeatureExtractor()
+        self.feature_dim = self.feature_extractor.feature_dim
+        self.index_path = index_path
+        self.metadata_path = metadata_path
+        self.metadata = {}
+        self.is_trained = True # Flat index is always trained
+        self.use_gpu = use_gpu
+
+        # Load existing or create new
+        if index_path and metadata_path and os.path.exists(index_path) and os.path.exists(metadata_path):
+            self.load(index_path, metadata_path)
+        else:
+            logger.info("Initializing Simple Flat L2 Index (No training required)")
+            self.index = faiss.IndexFlatL2(self.feature_dim)
+            if self.use_gpu:
+                self._to_gpu()
+
+    def _to_gpu(self):
+        if self.use_gpu:
+            try:
+                res = faiss.StandardGpuResources()
+                self.index = faiss.index_cpu_to_gpu(res, 0, self.index)
+            except Exception as e:
+                logger.warning(f"GPU failed, using CPU: {e}")
+
+    def index_images(self, image_dir: str):
+        """Batch index a directory."""
+        image_paths = [os.path.join(image_dir, f) for f in os.listdir(image_dir) 
+                       if f.lower().endswith(('.jpg', '.jpeg', '.png'))]
+        
+        if not image_paths:
+            return
+
+        for path in image_paths:
+            try:
+                feat = self.feature_extractor.extract_features(path)
+                self.index.add(np.array([feat]))
+                
+                new_id = self.index.ntotal - 1
+                self.metadata[str(new_id)] = {
+                    'photo_id': os.path.basename(path),
+                    'path': path,
+                    'timestamp': datetime.now().isoformat()
+                }
+            except Exception as e:
+                logger.error(f"Skipping {path}: {e}")
+        
+        logger.info(f"Indexed {len(image_paths)} images.")
+
+    def add_single_image(self, image_path: str, photo_id: str):
+        """Add one image to the index."""
+        features = self.feature_extractor.extract_features(image_path)
+        self.index.add(np.array([features]))
+        
+        new_id = self.index.ntotal - 1
+        self.metadata[str(new_id)] = {
+            'photo_id': photo_id,
+            'path': image_path,
+            'timestamp': datetime.now().isoformat()
+        }
+        
+        if self.index_path and self.metadata_path:
+            self.save(self.index_path, self.metadata_path)
+            
+        return new_id
+
+    def search(self, query_path: str, k: int = 5):
+        query_feat = self.feature_extractor.extract_features(query_path)
+        k = min(k, self.index.ntotal)
+        
+        distances, indices = self.index.search(query_feat.reshape(1, -1), k)
+        
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            s_idx = str(int(idx))
+            if s_idx in self.metadata:
+                item = self.metadata[s_idx]
+                results.append({
+                    "photo_id": item['photo_id'],
+                    "distance": float(dist),
+                    "path": item['path']
+                })
+        
+        return sorted(results, key=lambda x: x['distance'])
+
+    def find_path_by_id(self, photo_id: str):
+        # Allow string or int comparison for robustness
+        for item in self.metadata.values():
+            if str(item['photo_id']) == str(photo_id):
+                return item['path']
+        return None
+
+    def save(self, index_path, meta_path):
+        idx_to_save = faiss.index_gpu_to_cpu(self.index) if self.use_gpu else self.index
+        faiss.write_index(idx_to_save, index_path)
+        with open(meta_path, 'w') as f:
+            json.dump(self.metadata, f)
+
+    def load(self, index_path, meta_path):
+        self.index = faiss.read_index(index_path)
+        with open(meta_path, 'r') as f:
+            self.metadata = json.load(f)
+        if self.use_gpu:
+            self._to_gpu()
+================================================================================
+
+FILE PATH: services\store\Dockerfile
+--------------------------------------------------------------------------------
+FROM python:3.10-slim
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+COPY . .
+CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8101"]
+
+================================================================================
+
+FILE PATH: services\store\main.py
+--------------------------------------------------------------------------------
+"""
+Haystack-style Store Service
+---------------------------------------
+
+This Store node manages one or more **physical volumes**, each corresponding
+to a Haystack logical volume. Every Store maintains:
+
+- A per-volume needle file: data/haystack_<lv>.dat
+- A per-volume index file: data/<lv>.idx.json
+- An in-memory index: {photo_id → {offset, size, alt_key, deleted, checksum}}
+
+STORE BEHAVIOR:
+---------------
+- API Gateway passes X-Photo-ID, X-Cookie, X-Alt-Key
+- Store appends:
+    [4-byte header_len][header_json][data][sha256 checksum hex]
+- Store computes offset locally (replicas have different offsets → OK)
+
+ENDPOINTS:
+----------
+POST /volume/{lv}/append
+GET  /volume/{lv}/read?photo_id=...
+POST /volume/{lv}/delete
+GET  /volume/{lv}/exists?photo_id=...
+GET  /health
+"""
+
+import os
+import json
+import hashlib
+from fastapi import FastAPI, Header, Request, HTTPException
+from fastapi.responses import Response
+from typing import Dict
+import uvicorn
+
+app = FastAPI()
+
+# ---------------------------------------
+# Store Identity and Data Directory
+# ---------------------------------------
+
+STORE_ID = os.environ.get("STORE_ID", "store1")
+DATA_DIR = os.environ.get("DATA_DIR", "./data/store")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+# index[lv][photo_id] = {offset, size, alt_key, deleted, checksum}
+index: Dict[str, Dict[int, dict]] = {}
+
+# file handles cache
+files = {}
+
+
+# ---------------------------------------
+# Path helpers
+# ---------------------------------------
+
+def index_path_for(lv: str) -> str:
+    return os.path.join(DATA_DIR, f"{lv}.idx.json")
+
+
+def volume_path_for(lv: str) -> str:
+    return os.path.join(DATA_DIR, f"haystack_{lv}.dat")
+
+
+# ---------------------------------------
+# Index load & persist
+# ---------------------------------------
+
+def load_index(lv: str):
+    path = index_path_for(lv)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                index[lv] = {int(k): v for k, v in json.load(f).items()}
+        except Exception:
+            index[lv] = {}
+    else:
+        index[lv] = {}
+
+
+def persist_index(lv: str):
+    path = index_path_for(lv)
+    with open(path, "w") as f:
+        json.dump({str(k): v for k, v in index.get(lv, {}).items()}, f)
+
+
+# ---------------------------------------
+# Volume file handling
+# ---------------------------------------
+
+def open_volume_file(lv: str):
+    """Ensure an open append-mode file for logical volume lv."""
+    if lv not in files:
+        path = volume_path_for(lv)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fh = open(path, "ab+")
+        files[lv] = fh
+    return files[lv]
+
+
+def rebuild_index_from_volume(lv: str):
+    """
+    Rebuild index by scanning haystack_<lv>.dat.
+
+    Needle format:
+      [4-byte header_len][header_json][data][checksum_hex]
+    """
+    path = volume_path_for(lv)
+    idx = {}
+
+    if not os.path.exists(path):
+        index[lv] = {}
+        return
+
+    with open(path, "rb") as f:
+        offset = 0
+        while True:
+            hlen_b = f.read(4)
+            if not hlen_b or len(hlen_b) < 4:
+                break
+
+            hlen = int.from_bytes(hlen_b, "big")
+            header_raw = f.read(hlen)
+            if not header_raw or len(header_raw) < hlen:
+                break
+
+            try:
+                header = json.loads(header_raw.decode("utf-8"))
+            except Exception:
+                break
+
+            photo_id = int(header["photo_id"])
+            size = header["size"]
+            alt_key = header.get("alt_key", "orig")
+
+            data = f.read(size)
+            checksum_raw = f.read(64)   # 64-byte hex
+            checksum = checksum_raw.decode() if checksum_raw else None
+
+            idx[photo_id] = {
+                "offset": offset,
+                "size": size,
+                "alt_key": alt_key,
+                "deleted": False,
+                "checksum": checksum,
+            }
+
+            offset += 4 + hlen + size + (len(checksum_raw) if checksum_raw else 0)
+
+    index[lv] = idx
+    persist_index(lv)
+
+
+# ---------------------------------------
+# Startup: load default LV (lv-1)
+# ---------------------------------------
+
+@app.on_event("startup")
+def startup():
+    default_lv = "lv-1"     # Enough for project; extend as needed
+    if default_lv not in index:
+        load_index(default_lv)
+        # If empty index but file exists → rebuild
+        if not index[default_lv]:
+            rebuild_index_from_volume(default_lv)
+
+
+# ---------------------------------------
+# APPEND (write needle)
+# ---------------------------------------
+
+@app.post("/volume/{lv}/append")
+async def append(
+    lv: str,
+    request: Request,
+    x_photo_id: int = Header(None),
+    x_cookie: str = Header(None),
+    x_alt_key: str = Header("orig")
+):
+    if x_photo_id is None:
+        raise HTTPException(status_code=400, detail="Missing X-Photo-ID header")
+
+    data = await request.body()
+    size = len(data)
+
+    header = {
+        "photo_id": int(x_photo_id),
+        "alt_key": x_alt_key,
+        "size": size,
+        "cookie": x_cookie,
+    }
+
+    header_b = json.dumps(header).encode("utf-8")
+    header_len = len(header_b)
+
+    checksum = hashlib.sha256(data).hexdigest()
+
+    fh = open_volume_file(lv)
+    fh.seek(0, os.SEEK_END)
+    offset = fh.tell()
+
+    # Write needle frame
+    fh.write(header_len.to_bytes(4, "big"))
+    fh.write(header_b)
+    fh.write(data)
+    fh.write(checksum.encode("utf-8"))
+    fh.flush()
+
+    # Update in-memory index
+    if lv not in index:
+        index[lv] = {}
+
+    index[lv][int(x_photo_id)] = {
+        "offset": offset,
+        "size": size,
+        "alt_key": x_alt_key,
+        "deleted": False,
+        "checksum": checksum,
+    }
+
+    persist_index(lv)
+
+    return {
+        "status": "stored",
+        "lv": lv,
+        "offset": offset,
+        "size": size,
+        "checksum": checksum
+    }
+
+
+# ---------------------------------------
+# READ (retrieve needle)
+# ---------------------------------------
+
+@app.get("/volume/{lv}/read")
+def read(lv: str, photo_id: int = None):
+    if photo_id is None:
+        raise HTTPException(status_code=400, detail="photo_id required")
+
+    photo_id = int(photo_id)
+
+    if lv not in index or photo_id not in index[lv]:
+        raise HTTPException(status_code=404, detail="not found")
+
+    entry = index[lv][photo_id]
+    if entry["deleted"]:
+        raise HTTPException(status_code=410, detail="photo deleted")
+
+    offset = entry["offset"]
+    size = entry["size"]
+
+    path = volume_path_for(lv)
+    with open(path, "rb") as f:
+        f.seek(offset)
+
+        # Read header len
+        hlen_b = f.read(4)
+        if len(hlen_b) < 4:
+            raise HTTPException(status_code=500, detail="corrupt volume")
+
+        hlen = int.from_bytes(hlen_b, "big")
+        header_raw = f.read(hlen)
+        _ = header_raw  # parsed but unused
+        data = f.read(size)
+        checksum_raw = f.read(64)
+        checksum = checksum_raw.decode() if checksum_raw else None
+
+        # Optional checksum verification
+        if checksum and checksum != entry["checksum"]:
+            raise HTTPException(status_code=500, detail="checksum mismatch")
+
+        return Response(content=data, media_type="application/octet-stream")
+
+
+# ---------------------------------------
+# EXISTS
+# ---------------------------------------
+
+@app.get("/volume/{lv}/exists")
+def exists(lv: str, photo_id: int):
+    if lv not in index:
+        return {"exists": False}
+
+    entry = index[lv].get(int(photo_id))
+    if not entry:
+        return {"exists": False}
+
+    return {
+        "exists": True,
+        "offset": entry["offset"],
+        "size": entry["size"],
+        "deleted": entry["deleted"]
+    }
+
+
+# ---------------------------------------
+# DELETE (soft)
+# ---------------------------------------
+
+@app.post("/volume/{lv}/delete")
+def mark_delete(lv: str, payload: dict):
+    photo_id = int(payload.get("photo_id"))
+
+    if lv not in index or photo_id not in index[lv]:
+        return {"status": "not_found"}
+
+    index[lv][photo_id]["deleted"] = True
+    persist_index(lv)
+
+    # Append delete marker for compaction/audit
+    fh = open_volume_file(lv)
+    fh.seek(0, os.SEEK_END)
+
+    marker = {"delete": photo_id}
+    marker_b = json.dumps(marker).encode("utf-8")
+
+    fh.write(len(marker_b).to_bytes(4, "big"))
+    fh.write(marker_b)
+    fh.flush()
+
+    return {"status": "deleted", "photo_id": photo_id}
+
+
+# ---------------------------------------
+# HEALTH
+# ---------------------------------------
+
+@app.get("/health")
+def health():
+    totals = {lv: len(index.get(lv, {})) for lv in index}
+    return {"store_id": STORE_ID, "volumes": totals}
+
+
+if __name__ == "__main__":
+    uvicorn.run("services.store.main:app", host="0.0.0.0", reload=False)
+
+================================================================================
+
+FILE PATH: services\store\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+
+================================================================================
+
