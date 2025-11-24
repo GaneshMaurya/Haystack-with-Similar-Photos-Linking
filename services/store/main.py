@@ -45,9 +45,13 @@ app = FastAPI()
 
 STORE_ID = os.environ.get("STORE_ID", "store1")
 DATA_DIR = os.environ.get("DATA_DIR", "./data/store")
+# CRITICAL FIX: Read LV_CAPACITY_BYTES from environment, defaulting to the large value set by Directory
+# If the environment variable is not set, it will now default to 1GB
+LV_CAPACITY_BYTES = int(os.environ.get("LV_CAPACITY_BYTES", 1000000000)) 
 os.makedirs(DATA_DIR, exist_ok=True)
 
 logger.info(f"STORE_ID={STORE_ID}, DATA_DIR={DATA_DIR}")
+logger.info(f"Reported LV Capacity: {LV_CAPACITY_BYTES} bytes")
 
 # index[lv][photo_id] = {offset, size, alt_key, deleted, checksum}
 index: Dict[str, Dict[int, dict]] = {}
@@ -112,6 +116,18 @@ def open_volume_file(lv: str):
     return files[lv]
 
 
+def get_volume_size(lv: str) -> int:
+    """Returns the current size of the data file in bytes, or 0 if it doesn't exist."""
+    path = volume_path_for(lv)
+    try:
+        return os.path.getsize(path)
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        logger.error(f"Error getting size for {lv}: {e}", exc_info=True)
+        return 0
+
+
 def rebuild_index_from_volume(lv: str):
     """
     Rebuild index by scanning haystack_<lv>.dat.
@@ -132,6 +148,7 @@ def rebuild_index_from_volume(lv: str):
         with open(path, "rb") as f:
             offset = 0
             while True:
+                # ... (rest of rebuild logic remains the same) ...
                 hlen_b = f.read(4)
                 if not hlen_b or len(hlen_b) < 4:
                     break
@@ -179,13 +196,39 @@ def rebuild_index_from_volume(lv: str):
 
 @app.on_event("startup")
 def startup():
-    default_lv = "lv-1"     # Enough for project; extend as needed
+    # Load all volumes potentially referenced in the index files
+    # We load lv-1 explicitly to ensure it is in memory
+    default_lv = "lv-1"
     if default_lv not in index:
         load_index(default_lv)
-        # If empty index but file exists → rebuild
-        if not index[default_lv]:
+        if not index[default_lv] and get_volume_size(default_lv) > 0:
             rebuild_index_from_volume(default_lv)
     logger.info("Store startup complete")
+
+
+# ---------------------------------------
+# STATS (New endpoint for Directory polling)
+# ---------------------------------------
+
+@app.get("/volume/{lv}/stats")
+def get_volume_stats(lv: str):
+    """
+    Reports the current physical usage of the volume. 
+    Used by the Directory Primary for capacity polling.
+    """
+    size = get_volume_size(lv)
+    
+    # NOTE: LV_CAPACITY_BYTES is read from ENV and synchronized with the Directory's view.
+    
+    logger.debug(f"[STATS] lv={lv} reported size={size}")
+    
+    return {
+        "status": "ok",
+        "store_id": STORE_ID,
+        "logical_volume": lv,
+        "used_bytes": size,
+        "total_capacity_bytes": LV_CAPACITY_BYTES
+    }
 
 
 # ---------------------------------------
@@ -207,6 +250,13 @@ async def append(
 
     data = await request.body()
     size = len(data)
+
+    # Simple check against max capacity (for safety, though Directory should prevent this)
+    current_size = get_volume_size(lv)
+    if current_size + size > LV_CAPACITY_BYTES:
+         logger.error(f"[APPEND] Volume {lv} exceeded local capacity ({current_size + size} > {LV_CAPACITY_BYTES}). Rejecting.")
+         # Return the appropriate HTTP status code to signal client/directory failure
+         raise HTTPException(status_code=413, detail="Volume capacity exceeded.") 
 
     header = {
         "photo_id": int(x_photo_id),
@@ -385,4 +435,4 @@ def health():
 if __name__ == "__main__":
     logger.info("Starting Store Service with Uvicorn")
     port = int(os.environ.get("PORT", "8101"))
-    uvicorn.run("services.store.main:app", host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)

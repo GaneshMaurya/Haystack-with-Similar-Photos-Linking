@@ -4,25 +4,29 @@ Haystack-style Directory FastAPI app.
 DIRECTORY MODE LOGIC:
 - Uses Discovery Service to manage its mode (primary/replica).
 - Periodically registers its status.
-- Checks Discovery Service for its designated role and automatically 
-  promotes itself if the Discovery Service has declared it the new leader.
+
+REPLICATION LOGIC (ASYNC):
+- Primary (only) publishes all DB changes to RabbitMQ for Replicas to consume.
 """
 
 import os
 import sys
 import time
 import asyncio
-import httpx # REQUIRED for Discovery Service communication
+import httpx
 import logging
 import uvicorn
+from typing import Optional
+import pika # NEW: Import pika for RabbitMQ
+import json   # REQUIRED for message payload
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 import services.directory.models as models
-from typing import List
+from typing import List, Dict, Any
 
 # ============================================
-# LOGGING CONFIGURATION (User's Detailed Setup)
+# LOGGING CONFIGURATION (User's Detailed Setup - RETAINED)
 # ============================================
 
 LOG_DIR = os.environ.get("LOG_DIR", "./logs")
@@ -75,7 +79,7 @@ except Exception as e:
     raise
 
 # ============================================
-# ENVIRONMENT VARIABLES
+# ENVIRONMENT VARIABLES & RABBITMQ SETUP
 # ============================================
 
 # NOTE: DIRECTORY_MODE will be dynamically managed by the discovery loop
@@ -84,15 +88,94 @@ DISCOVERY_SERVICE_URL = os.environ.get("DISCOVERY_SERVICE_URL", "http://discover
 SERVICE_NAME = os.environ.get("HOSTNAME", f"directory_{DIRECTORY_MODE}")
 AVAILABLE_STORES_RAW = os.environ.get("AVAILABLE_STORES", "store1,store2")
 AVAILABLE_STORES = [s.strip() for s in AVAILABLE_STORES_RAW.split(',') if s.strip()]
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/") # NEW
 
 REGISTRATION_INTERVAL = int(os.environ.get("REGISTRATION_INTERVAL", "5"))
 INITIAL_VOLUME_ID = "lv-1"
 
 logger.info(f"Service Name: {SERVICE_NAME}")
 logger.info(f"Mode: {DIRECTORY_MODE}")
-logger.info(f"Discovery Service URL: {DISCOVERY_SERVICE_URL}")
 logger.info(f"Available Stores for Volume: {AVAILABLE_STORES}")
-logger.info(f"Registration Interval: {REGISTRATION_INTERVAL} seconds")
+logger.info(f"RabbitMQ URL: {RABBITMQ_URL}")
+
+# Global RabbitMQ connection (used by publisher)
+RABBITMQ_CONNECTION: Optional[pika.BlockingConnection] = None
+RABBITMQ_CHANNEL: Optional[pika.channel.Channel] = None
+
+
+# --------------------------------------------
+# RabbitMQ Publisher Logic (Primary Only)
+# --------------------------------------------
+
+def setup_rabbitmq_publisher():
+    """Initializes a blocking connection and channel for publishing events."""
+    global RABBITMQ_CONNECTION, RABBITMQ_CHANNEL
+    try:
+        if RABBITMQ_CONNECTION and RABBITMQ_CONNECTION.is_open:
+            return
+
+        params = pika.URLParameters(RABBITMQ_URL)
+        RABBITMQ_CONNECTION = pika.BlockingConnection(params)
+        RABBITMQ_CHANNEL = RABBITMQ_CONNECTION.channel()
+        
+        # Declare the exchange used for directory updates (durable topic exchange)
+        RABBITMQ_CHANNEL.exchange_declare(
+            exchange='directory.updates', 
+            exchange_type='topic', 
+            durable=True
+        )
+        logger.info("RabbitMQ publisher connection established.")
+    except Exception as e:
+        logger.error(f"Failed to set up RabbitMQ publisher: {e}", exc_info=True)
+        RABBITMQ_CONNECTION = None
+        RABBITMQ_CHANNEL = None
+
+
+def close_rabbitmq_publisher():
+    """Closes the RabbitMQ connection."""
+    global RABBITMQ_CONNECTION, RABBITMQ_CHANNEL
+    if RABBITMQ_CONNECTION and RABBITMQ_CONNECTION.is_open:
+        RABBITMQ_CONNECTION.close()
+        logger.info("RabbitMQ publisher connection closed.")
+    RABBITMQ_CONNECTION = None
+    RABBITMQ_CHANNEL = None
+
+
+def publish_directory_update(operation: str, payload: Dict[str, Any]):
+    """Publishes a structured update message to the directory.updates exchange."""
+    if DIRECTORY_MODE != 'primary':
+        return # Only the primary publishes updates
+
+    if not RABBITMQ_CHANNEL:
+        logger.warning(f"RabbitMQ channel not available for {operation}. Attempting reconnect.")
+        setup_rabbitmq_publisher()
+        if not RABBITMQ_CHANNEL:
+            logger.error(f"Failed to publish {operation}: RabbitMQ unavailable.")
+            return
+
+    try:
+        routing_key = f"dir.{operation.lower()}"
+        message = {
+            "operation": operation,
+            "timestamp": time.time(),
+            "source": SERVICE_NAME,
+            "payload": payload
+        }
+        
+        RABBITMQ_CHANNEL.basic_publish(
+            exchange='directory.updates',
+            routing_key=routing_key,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(delivery_mode=2) # Persistent message
+        )
+        logger.info(f"Published update: {routing_key} for photo {payload.get('photo_id')}")
+        
+    except pika.exceptions.AMQPConnectionError:
+        logger.error("RabbitMQ connection lost. Reconnecting...")
+        close_rabbitmq_publisher()
+    except Exception as e:
+        logger.error(f"Failed to publish {operation} message: {e}", exc_info=True)
+
 
 # -----------------------
 # Request Models
@@ -155,7 +238,7 @@ async def register_and_check_promotion():
     Periodically registers with the Discovery Service and checks if this instance
     has been declared the new leader, updating the global state.
     """
-    global DIRECTORY_MODE # CRITICAL: Allows modification of the global variable
+    global DIRECTORY_MODE 
     
     internal_url = f"http://{SERVICE_NAME}:8001"
     
@@ -182,11 +265,13 @@ async def register_and_check_promotion():
                         # CRITICAL: DS has promoted us! Change internal state.
                         DIRECTORY_MODE = "primary"
                         logger.critical(">>> PROMOTION SUCCESSFUL: I AM NOW THE PRIMARY LEADER <<<")
+                        setup_rabbitmq_publisher() # NEW: Setup publisher upon taking leadership
                         
                     elif leader_data.get('service_name') != SERVICE_NAME and DIRECTORY_MODE == 'primary':
                         # Fencing/Demotion: Another instance was elected. Step down.
                         DIRECTORY_MODE = "replica"
                         logger.warning("<<< DEMOTION OCCURRED: Another service was elected Primary. I am now a Replica. >>>")
+                        close_rabbitmq_publisher() # NEW: Close publisher upon demotion
                         
                     elif leader_data.get('service_name') != SERVICE_NAME:
                          logger.info(f"Primary is {leader_data.get('service_name')}. Running as {DIRECTORY_MODE}.")
@@ -203,6 +288,10 @@ async def register_and_check_promotion():
             await asyncio.sleep(REGISTRATION_INTERVAL)
         except asyncio.CancelledError:
             break
+
+# --------------------------------------------
+# Initial Sync and Consumption Logic (To be built later for Replicas)
+# --------------------------------------------
 
 
 # -----------------------
@@ -222,10 +311,13 @@ async def startup_event():
         logger.error(f"FATAL DIRECTORY ERROR during volume initialization: {e}", exc_info=True)
         raise
     
-    # 2. Start the periodic registration and promotion check task
+    # 2. Setup RabbitMQ publisher if we start as primary (Initial state)
+    if DIRECTORY_MODE == 'primary':
+        setup_rabbitmq_publisher()
+    
+    # 3. Start the periodic registration and promotion check task
     logger.info(f"Starting periodic discovery registration task for {SERVICE_NAME}...")
     try:
-        # NOTE: This is the task that manages the global DIRECTORY_MODE state
         app.state.discovery_task = asyncio.create_task(register_and_check_promotion())
         logger.info(f"Directory service started successfully in {DIRECTORY_MODE} mode")
     except Exception as e:
@@ -237,7 +329,10 @@ async def startup_event():
 async def shutdown_event():
     logger.info("Shutdown event triggered")
     
-    # Cancel the periodic registration task
+    # 1. Close RabbitMQ publisher connection
+    close_rabbitmq_publisher()
+
+    # 2. Cancel the periodic registration task
     if hasattr(app.state, 'discovery_task'):
         logger.info("Cancelling discovery registration task...")
         app.state.discovery_task.cancel()
@@ -275,16 +370,31 @@ def allocate(req: AllocateReq):
         ensure_primary()
         logger.debug(f"[ALLOCATE] Primary mode verified")
         
-        r = models.allocate_write(req.size, req.alt_key or "orig")
+        # NOTE: Pass AVAILABLE_STORES to models layer for potential LV rollover
+        r = models.allocate_write(req.size, req.alt_key or "orig", available_stores=AVAILABLE_STORES)
         
-        logger.info(f"[ALLOCATE] SUCCESS: photo_id={r['photo_id']}, lv={r['logical_volume']}, replicas={r['replicas']}")
-        
-        return {
+        # --- 1. Update Volume Usage (Simulated Write) ---
+        try:
+            models.update_volume_usage(r["logical_volume"], req.size)
+            logger.info(f"[ALLOCATE] Volume usage updated for {r['logical_volume']}")
+        except Exception as update_e:
+            logger.error(f"[ALLOCATE] FAILED to update volume usage: {update_e}", exc_info=True)
+
+        # --- 2. Publish Allocation Event ---
+        publish_directory_update("ALLOCATE", {
             "photo_id": r["photo_id"],
             "logical_volume": r["logical_volume"],
+            "replicas": r["replicas"],
             "cookie": r["cookie"],
-            "replicas": r["replicas"]
-        }
+            "alt_key": req.alt_key or "orig",
+            "size": req.size,
+            "status": "alloc"
+        })
+
+        logger.info(f"[ALLOCATE] SUCCESS: photo_id={r['photo_id']}, lv={r['logical_volume']}, replicas={r['replicas']}")
+        
+        return r
+        
     except HTTPException as e:
         logger.error(f"[ALLOCATE] HTTP Exception: {e.status_code} - {e.detail}")
         raise
@@ -310,6 +420,12 @@ def commit(req: CommitReq):
         
         result = models.commit_write(req.photo_id)
         
+        # --- Publish Commit Event ---
+        publish_directory_update("COMMIT", {
+            "photo_id": req.photo_id,
+            "status": "active"
+        })
+        
         logger.info(f"[COMMIT] SUCCESS: photo_id={req.photo_id}")
         return result
         
@@ -334,6 +450,11 @@ def delete(req: DeleteReq):
         logger.debug(f"[DELETE] Primary mode verified")
         
         result = models.mark_deleted(req.photo_id)
+        
+        # --- Publish Delete Event ---
+        publish_directory_update("DELETE", {
+            "photo_id": req.photo_id
+        })
         
         logger.info(f"[DELETE] SUCCESS: photo_id={req.photo_id}")
         return result
@@ -443,6 +564,27 @@ def status():
             "status": "error",
             "error": str(e)
         }
+
+
+# --------------------------------------------
+# EXPORT ENDPOINT (For Replica Bootstrapping)
+# --------------------------------------------
+
+@app.get("/sync/full-dump")
+def get_full_data_dump():
+    """
+    Retrieves all photo metadata. Used by new Replicas for bootstrapping history.
+    """
+    if DIRECTORY_MODE != 'primary':
+        raise HTTPException(status_code=405, detail="Only Primary can provide the full data dump.")
+        
+    try:
+        data = models.list_all_photos_data() # New function in models.py
+        logger.info(f"Exported {len(data)} photo records for snapshot sync.")
+        return data
+    except Exception as e:
+        logger.error(f"Failed to generate full data dump: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database read error during export.")
 
 
 # ============================================
