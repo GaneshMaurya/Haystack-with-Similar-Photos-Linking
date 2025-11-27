@@ -1,10 +1,9 @@
 fastapi
 uvicorn
+pika
 httpx
-pydantic
-faiss-cpu
+numpy<2
+pillow
 torch
 torchvision
-numpy
-Pillow
-python-multipart
+faiss-cpu

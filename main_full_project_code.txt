@@ -1,0 +1,3389 @@
+PROJECT EXPORT
+Root: C:\Users\Saich\OneDrive\Desktop\1sai\main\Haystack_Main
+================================================================================
+
+FILE PATH: .gitignore
+--------------------------------------------------------------------------------
+venv/
+__pycache__/
+data/
+*.log
+*.jpg
+*.jpeg
+testdata/
+.pytest_cache/
+================================================================================
+
+FILE PATH: docker-compose.yml
+--------------------------------------------------------------------------------
+version: "3.8"
+
+# Define a shared network for service communication
+networks:
+  haystack-net:
+    driver: bridge
+
+# Define volumes for persistent data (FAISS index, SQLite DB, Store data, Cache data)
+volumes:
+  data-volume:
+    driver: local
+  rabbitmq-data: # Uncomment this volume when activating RabbitMQ
+    driver: local
+
+services:
+  # ----------------------------------------------------
+  # 1. API Gateway (Entry Point)
+  # ----------------------------------------------------
+  api:
+    build:
+      context: .
+      dockerfile: services/api/Dockerfile
+    image: haystack-api:latest
+    ports:
+      - "8000:8000" # Expose the API Gateway port
+    environment:
+      # DIRECTORY access is now through the Discovery Service (DS)
+      DISCOVERY_SERVICE_URL: http://discovery:8501
+      CACHE_URL: http://cache:8201
+      SIMILARITY_URL: http://similarity:8301
+      USE_RABBITMQ: "0" # Currently disabled. Set to "1" when activating RabbitMQ.
+      # Store mapping uses internal service names/ports (no localhost)
+      STORE_PORTS: "store1=store1:8101,store2=store2:8101,store3=store3:8101"
+    networks:
+      - haystack-net
+    depends_on:
+      - discovery
+      - directory_primary
+      - directory_replica
+      - store1
+      - store2
+      - store3
+      - cache
+      - similarity
+      - rabbitmq # Uncomment this when activating RabbitMQ
+    # CMD using the fully qualified path
+    command:
+      [
+        "uvicorn",
+        "services.api.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+      ]
+
+  # ----------------------------------------------------
+  # 2. Service Discovery (New Central Registry)
+  # ----------------------------------------------------
+  discovery:
+    build:
+      context: .
+      dockerfile: services/discovery/Dockerfile
+    image: haystack-discovery:latest
+    environment:
+      # Data file for persistence (inside shared volume)
+      DISCOVERY_FILE: data/discovery.json
+    ports:
+      - "8501:8501" # Host port for testing discovery directly
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data
+    command:
+      [
+        "uvicorn",
+        "services.discovery.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8501",
+      ]
+
+  # ----------------------------------------------------
+  # 3. Directory Services (Primary & Replica)
+  # ----------------------------------------------------
+  directory_primary:
+    build:
+      context: .
+      dockerfile: services/directory/Dockerfile
+    image: haystack-directory:latest
+    environment:
+      DIRECTORY_MODE: primary
+      DISCOVERY_SERVICE_URL: http://discovery:8501
+      DB_PATH: data/directory.db
+      # Directory knows what stores are available for allocation
+      AVAILABLE_STORES: "store1,store2,store3"
+      HOSTNAME: directory_primary
+      # *** INCREASED CAPACITY TO 1 GB TO BYPASS ROLLOVER CRASH ***
+      LV_CAPACITY_BYTES: 1000000000
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+    ports:
+      - "8001:8001"
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data
+    depends_on:
+      - discovery
+      - rabbitmq
+    command:
+      [
+        "uvicorn",
+        "services.directory.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8001",
+      ]
+
+  directory_replica:
+    build:
+      context: .
+      dockerfile: services/directory/Dockerfile
+    image: haystack-directory:latest
+    environment:
+      DIRECTORY_MODE: replica
+      DISCOVERY_SERVICE_URL: http://discovery:8501
+      DB_PATH: data/directory.db
+      AVAILABLE_STORES: "store1,store2,store3"
+      HOSTNAME: directory_replica
+      # Set capacity to 1 GB
+      LV_CAPACITY_BYTES: 1000000000
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data
+    depends_on:
+      - discovery
+      - rabbitmq
+    command:
+      [
+        "uvicorn",
+        "services.directory.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8001",
+      ]
+
+  # ----------------------------------------------------
+  # 4. Store Services (Three Instances for 3-way replication)
+  # ----------------------------------------------------
+  store1:
+    build:
+      context: .
+      dockerfile: services/store/Dockerfile
+    image: haystack-store:latest
+    environment:
+      STORE_ID: store1
+      DATA_DIR: /app/data/store1_data
+    ports:
+      - "8101:8101"
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data/store1_data
+    command:
+      [
+        "uvicorn",
+        "services.store.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8101",
+      ]
+
+  store2:
+    build:
+      context: .
+      dockerfile: services/store/Dockerfile
+    image: haystack-store:latest
+    environment:
+      STORE_ID: store2
+      DATA_DIR: /app/data/store2_data
+    ports:
+      - "8102:8101" # Host 8102 -> Container 8101
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data/store2_data
+    command:
+      [
+        "uvicorn",
+        "services.store.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8101",
+      ]
+
+  store3:
+    build:
+      context: .
+      dockerfile: services/store/Dockerfile
+    image: haystack-store:latest
+    environment:
+      STORE_ID: store3
+      DATA_DIR: /app/data/store3_data
+    ports:
+      - "8103:8101" # Host 8103 -> Container 8101
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data/store3_data
+    command:
+      [
+        "uvicorn",
+        "services.store.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8101",
+      ]
+
+  # ----------------------------------------------------
+  # 5. Similarity Service (CPU Only)
+  # ----------------------------------------------------
+  similarity:
+    build:
+      context: .
+      dockerfile: services/similarity/Dockerfile
+    image: haystack-similarity:latest
+    ports:
+      - "8301:8301"
+    environment:
+      DATA_BASE_DIR: /app/data
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data
+    command:
+      [
+        "uvicorn",
+        "services.similarity.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8301",
+      ]
+
+  # ----------------------------------------------------
+  # 6. Cache Service
+  # ----------------------------------------------------
+  cache:
+    build:
+      context: .
+      dockerfile: services/cache/Dockerfile
+    image: haystack-cache:latest
+    environment:
+      CACHE_DATA_DIR: /app/data/cache_data
+      MAX_CACHE_SIZE_BYTES: 50000000
+    ports:
+      - "8201:8201"
+    networks:
+      - haystack-net
+    volumes:
+      - data-volume:/app/data
+    command:
+      [
+        "uvicorn",
+        "services.cache.main:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8201",
+      ]
+
+  # ----------------------------------------------------
+  # 7. RabbitMQ Service (Asynchronous Messaging)
+  # ----------------------------------------------------
+  rabbitmq:
+    image: rabbitmq:3-management
+    ports:
+      - "5673:5672" # Standard AMQP port
+      - "15673:15672" # Management interface
+    volumes:
+      - rabbitmq-data:/var/lib/rabbitmq
+    networks:
+      - haystack-net
+
+================================================================================
+
+FILE PATH: README.md
+--------------------------------------------------------------------------------
+# Haystack-with-Similar-Photos-Linking
+================================================================================
+
+FILE PATH: requirements.txt
+--------------------------------------------------------------------------------
+Pillow
+numpy
+faiss-cpu
+python-multipart
+torch
+torch-vision
+fastapi
+uvicorn[standard]
+httpx
+pika
+six
+================================================================================
+
+FILE PATH: services\api\Dockerfile
+--------------------------------------------------------------------------------
+# ...existing code...
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY services/api/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Ensure import path "services.api.main" resolves
+COPY services /app/services
+
+COPY services/api/main.py .
+
+CMD ["uvicorn", "services.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# ...existing code...
+================================================================================
+
+FILE PATH: services\api\main.py
+--------------------------------------------------------------------------------
+"""
+Haystack-style API Gateway (client-facing). Implements:
+- POST /upload  -> Discovery Lookup (Leader) -> allocate -> append to ALL stores -> commit
+- POST /find_similar -> Query Similarity Service
+- GET  /photo/{photo_id} -> Directory (Load-Balanced Read) -> Cache lookup -> Read from ANY replica
+- DELETE /photo/{photo_id} -> Discovery Lookup (Leader) -> Directory delete -> delete from ALL replicas -> delete from cache
+"""
+
+import os
+import json
+import httpx
+import random
+import logging
+import uvicorn
+import pika
+from fastapi import FastAPI, File, UploadFile, HTTPException, Response, Form
+from typing import Optional, List
+
+# ============================================
+# LOGGING CONFIGURATION
+# ============================================
+
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+API_LOG_FILE = os.path.join(LOG_DIR, "api.log")
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Remove any existing handlers to avoid duplicates
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+# Add file handler
+file_handler = logging.FileHandler(API_LOG_FILE)
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('[%(asctime)s] %(levelname)s - %(name)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+root_logger.addHandler(file_handler)
+
+# Add console handler
+console_handler = logging.StreamHandler()
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('[%(asctime)s] %(levelname)s - %(name)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+root_logger.addHandler(console_handler)
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
+
+logger.info("=" * 60)
+logger.info("API Gateway Starting")
+logger.info(f"Log file: {API_LOG_FILE}")
+logger.info("=" * 60)
+
+# ============================================
+# FASTAPI APP INITIALIZATION
+# ============================================
+
+app = FastAPI(title="API Gateway")
+
+# ============================================
+# ENVIRONMENT CONFIGURATION
+# ============================================
+
+DISCOVERY_SERVICE_URL = os.environ.get("DISCOVERY_SERVICE_URL", "http://discovery:8501")
+DIRECTORY_URL = os.environ.get("DIRECTORY_URL", "http://localhost:8080")
+CACHE_URL = os.environ.get("CACHE_URL", "http://cache:8201")
+SIMILARITY_URL = os.environ.get("SIMILARITY_URL", "http://similarity:8301")
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
+USE_RABBITMQ = os.environ.get("USE_RABBITMQ", "0") == "1"
+
+logger.info(f"DISCOVERY_SERVICE_URL: {DISCOVERY_SERVICE_URL}")
+logger.info(f"DIRECTORY_URL: {DIRECTORY_URL}")
+logger.info(f"CACHE_URL: {CACHE_URL}")
+logger.info(f"SIMILARITY_URL: {SIMILARITY_URL}")
+logger.info(f"USE_RABBITMQ: {USE_RABBITMQ}")
+
+# STORE_ID -> PORT/ADDRESS mapping
+_STORE_MAP_RAW = os.environ.get("STORE_PORTS", "store1=8101,store2=8102")
+_STORE_MAP = {}
+for kv in filter(None, _STORE_MAP_RAW.split(",")):
+    if "=" in kv:
+        k, v = kv.split("=", 1)
+        _STORE_MAP[k.strip()] = v.strip()
+
+logger.info(f"Store map: {_STORE_MAP}")
+
+# ============================================
+# INTERNAL HELPERS
+# ============================================
+
+def make_store_url(store_id: str) -> str:
+    """
+    Constructs the correct URL for a Store service based on the environment map.
+    Handles both Docker network addresses (storeX:port) and local ports.
+    """
+    logger.debug(f"Resolving store URL for store_id: {store_id}")
+    
+    port_or_address = _STORE_MAP.get(store_id)
+    
+    if port_or_address:
+        if ':' in port_or_address:
+            url = f"http://{port_or_address}"
+            logger.debug(f"Store {store_id} -> {url} (full address)")
+            return url
+        else:
+            url = f"http://localhost:{port_or_address}"
+            logger.debug(f"Store {store_id} -> {url} (local port)")
+            return url
+    
+    logger.warning(f"Store {store_id} not in map, using default fallback")
+    return "http://localhost:8101"
+
+
+async def _get_directory_leader_url() -> str:
+    """Queries the Discovery Service to find the current Directory Primary."""
+    logger.info("Querying Discovery Service for Directory leader...")
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{DISCOVERY_SERVICE_URL}/leader", timeout=5.0)
+            
+            if r.status_code == 200:
+                data = r.json()
+                leader_url = data["url"]
+                logger.info(f"Directory leader found: {leader_url}")
+                return leader_url
+            elif r.status_code == 503:
+                logger.error("Directory leader election failed: No healthy instances available")
+                raise HTTPException(status_code=503, detail="Directory leader election failed: No healthy instances available.")
+            else:
+                logger.error(f"Discovery service error: {r.status_code} - {r.text}")
+                raise HTTPException(status_code=500, detail=f"Discovery service error: {r.text}")
+    except httpx.RequestError as e:
+        logger.error(f"Cannot connect to Discovery Service: {e}")
+        raise HTTPException(status_code=503, detail="Service Discovery is unavailable.")
+
+
+async def _get_directory_read_url() -> str:
+    """Queries the Discovery Service for a list of healthy replicas and returns one randomly."""
+    logger.info("Querying Discovery Service for Directory read replica...")
+    
+    try:
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{DISCOVERY_SERVICE_URL}/replicas", timeout=5.0)
+            
+            if r.status_code == 200:
+                urls = r.json().get("urls", [])
+                if not urls:
+                    logger.error("No healthy Directory instances for reading")
+                    raise HTTPException(status_code=503, detail="No healthy Directory instances for reading.")
+                
+                selected_url = random.choice(urls)
+                logger.info(f"Directory read replica selected: {selected_url}")
+                return selected_url
+            else:
+                logger.error(f"Discovery service error during read lookup: {r.status_code} - {r.text}")
+                raise HTTPException(status_code=500, detail=f"Discovery service error during read lookup: {r.text}")
+    except httpx.RequestError as e:
+        logger.error(f"Cannot connect to Discovery Service for reads: {e}")
+        raise HTTPException(status_code=503, detail="Service Discovery is unavailable for reads.")
+
+
+def publish_event(payload: dict):
+    """Publish event to RabbitMQ or local file."""
+    logger.info(f"Publishing event: {payload.get('event', 'unknown')}")
+    
+    if not USE_RABBITMQ:
+        try:
+            os.makedirs("./data", exist_ok=True)
+            with open("./data/events.log", "a") as f:
+                f.write(json.dumps(payload) + "\n")
+            logger.info(f"Event logged to ./data/events.log")
+        except Exception as e:
+            logger.error(f"Failed to write event to file: {e}")
+        return
+    
+    try:
+        params = pika.URLParameters(RABBITMQ_URL)
+        conn = pika.BlockingConnection(params)
+        ch = conn.channel()
+        ch.exchange_declare(exchange='photo.events', exchange_type='topic', durable=True)
+        ch.basic_publish(
+            exchange='photo.events',
+            routing_key='photo.uploaded',
+            body=json.dumps(payload),
+            properties=pika.BasicProperties(delivery_mode=2)
+        )
+        conn.close()
+        logger.info(f"Event published to RabbitMQ successfully")
+    except Exception as e:
+        logger.error(f"Failed to publish event to RabbitMQ: {e}")
+
+
+# ============================================
+# UPLOAD ENDPOINT
+# ============================================
+
+@app.post("/upload")
+async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
+    """
+    Upload a photo: allocate -> append to all stores -> commit -> similarity indexing
+    """
+    logger.info(f"[UPLOAD] Starting upload for file: {file.filename}")
+    
+    try:
+        data = await file.read()
+        size = len(data)
+        logger.info(f"[UPLOAD] File size: {size} bytes")
+
+        # 1) Locate Primary Directory via Discovery Service
+        directory_leader_url = await _get_directory_leader_url()
+        logger.info(f"[UPLOAD] Step 1: Directory leader selected: {directory_leader_url}")
+        
+        # 2) Allocate from Directory Primary
+        logger.info(f"[UPLOAD] Step 2: Calling allocate_write on {directory_leader_url}")
+        async with httpx.AsyncClient() as client:
+            r = await client.post(
+                f"{directory_leader_url}/allocate_write",
+                json={"size": size, "alt_key": alt_key},
+                timeout=10.0
+            )
+        
+        if r.status_code != 200:
+            logger.error(f"[UPLOAD] allocate_write failed: {r.status_code} - {r.text}")
+            raise HTTPException(status_code=500, detail=f"allocate_write failed: {r.text}")
+
+        alloc = r.json()
+        photo_id = alloc["photo_id"]
+        logical_volume = alloc["logical_volume"]
+        cookie = alloc["cookie"]
+        replicas = alloc["replicas"]
+        
+        logger.info(f"[UPLOAD] Step 2 Complete: photo_id={photo_id}, lv={logical_volume}, replicas={replicas}")
+
+        headers = {
+            "X-Photo-ID": str(photo_id),
+            "X-Cookie": cookie,
+            "X-Alt-Key": alt_key
+        }
+
+        # 3) Append synchronously to ALL stores
+        logger.info(f"[UPLOAD] Step 3: Appending to {len(replicas)} store(s)")
+        failed: List[str] = []
+        
+        for idx, store in enumerate(replicas):
+            store_url = make_store_url(store)
+            logger.info(f"[UPLOAD] Step 3.{idx+1}/{len(replicas)}: Appending to {store} at {store_url}")
+            
+            try:
+                async with httpx.AsyncClient() as sclient:
+                    r2 = await sclient.post(
+                        f"{store_url}/volume/{logical_volume}/append",
+                        content=data,
+                        headers=headers,
+                        timeout=30.0
+                    )
+                
+                if r2.status_code != 200:
+                    logger.error(f"[UPLOAD] Store {store} append failed: {r2.status_code} - {r2.text}")
+                    failed.append(store)
+                else:
+                    logger.info(f"[UPLOAD] Store {store} append successful")
+                    
+            except Exception as e:
+                logger.error(f"[UPLOAD] Exception with store {store}: {e}")
+                failed.append(store)
+
+        if failed:
+            logger.error(f"[UPLOAD] Append failed on stores: {failed}")
+            raise HTTPException(status_code=500, detail=f"Append failed on: {failed}")
+
+        logger.info(f"[UPLOAD] Step 3 Complete: All stores appended successfully")
+
+        # 4) Commit write in Directory Primary
+        logger.info(f"[UPLOAD] Step 4: Committing write to Directory")
+        async with httpx.AsyncClient() as client:
+            rc = await client.post(
+                f"{directory_leader_url}/commit_write",
+                json={"photo_id": photo_id},
+                timeout=5.0
+            )
+
+        if rc.status_code != 200:
+            logger.error(f"[UPLOAD] commit_write failed: {rc.status_code} - {rc.text}")
+            raise HTTPException(status_code=500, detail=f"commit_write failed: {rc.text}")
+
+        logger.info(f"[UPLOAD] Step 4 Complete: Write committed successfully")
+
+        # 5) Upload to Similarity Service
+        logger.info(f"[UPLOAD] Step 5: Submitting to similarity service")
+        try:
+            async with httpx.AsyncClient() as client:
+                form_data = {'photo_id': str(photo_id)}
+                file_data = {'file': (file.filename, data, file.content_type)}
+                
+                r_sim = await client.post(
+                    f"{SIMILARITY_URL}/upload/",
+                    data=form_data,
+                    files=file_data,
+                    timeout=30.0
+                )
+                
+                if r_sim.status_code == 200:
+                    logger.info(f"[UPLOAD] Step 5 Complete: Photo {photo_id} submitted to similarity service")
+                else:
+                    logger.warning(f"[UPLOAD] Similarity service returned {r_sim.status_code}: {r_sim.text}")
+        except Exception as e:
+            logger.error(f"[UPLOAD] Failed to submit to similarity service: {e}")
+
+        # 6) Publish event
+        logger.info(f"[UPLOAD] Step 6: Publishing event")
+        publish_event({
+            "event": "photo.uploaded",
+            "photo_id": photo_id,
+            "logical_volume": logical_volume,
+            "replicas": replicas
+        })
+
+        logger.info(f"[UPLOAD] SUCCESS: photo_id={photo_id}")
+        return {"photo_id": photo_id, "logical_volume": logical_volume}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[UPLOAD] UNEXPECTED ERROR: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Upload failed due to unexpected error")
+
+
+# ============================================
+# READ ENDPOINT
+# ============================================
+
+@app.get("/photo/{photo_id}")
+async def serve_photo(photo_id: int):
+    """
+    Read a photo: lookup directory -> cache lookup -> store read
+    """
+    logger.info(f"[READ] Starting read for photo_id={photo_id}")
+    
+    try:
+        # 1) Lookup Directory Read URL
+        logger.info(f"[READ] Step 1: Querying Directory for metadata")
+        directory_read_url = await _get_directory_read_url()
+        
+        # 2) Lookup metadata from Directory
+        async with httpx.AsyncClient() as client:
+            r = await client.get(f"{directory_read_url}/photo/{photo_id}")
+        
+        if r.status_code != 200:
+            logger.error(f"[READ] Photo {photo_id} not found in Directory: {r.status_code}")
+            raise HTTPException(status_code=404, detail="photo not found")
+
+        meta = r.json()
+        
+        if meta["status"] != "active":
+            logger.error(f"[READ] Photo {photo_id} is not active, status={meta['status']}")
+            raise HTTPException(status_code=410, detail="photo deleted")
+
+        logical_volume = meta["logical_volume"]
+        replicas = meta["replicas"]
+        
+        logger.info(f"[READ] Step 1 Complete: lv={logical_volume}, replicas={replicas}")
+
+        # 3) Cache lookup
+        logger.info(f"[READ] Step 2: Checking cache")
+        async with httpx.AsyncClient() as client:
+            try:
+                cresp = await client.get(f"{CACHE_URL}/cache/photo/{photo_id}", timeout=5.0)
+                if cresp.status_code == 200:
+                    logger.info(f"[READ] Step 2 Complete: Cache HIT for photo {photo_id}")
+                    return Response(content=cresp.content, media_type="application/octet-stream")
+            except Exception as e:
+                logger.info(f"[READ] Cache miss or error: {e}")
+
+        logger.info(f"[READ] Step 2 Complete: Cache MISS")
+
+        # 4) Cache miss → Try Store replicas
+        logger.info(f"[READ] Step 3: Reading from stores")
+        for idx, store in enumerate(replicas):
+            store_url = make_store_url(store)
+            logger.info(f"[READ] Step 3.{idx+1}/{len(replicas)}: Trying store {store} at {store_url}")
+            
+            try:
+                async with httpx.AsyncClient() as sclient:
+                    resp = await sclient.get(
+                        f"{store_url}/volume/{logical_volume}/read",
+                        params={"photo_id": photo_id},
+                        timeout=10.0
+                    )
+                
+                if resp.status_code == 200:
+                    logger.info(f"[READ] Step 3 Complete: Store {store} HIT")
+                    
+                    # Store in cache (best effort)
+                    try:
+                        async with httpx.AsyncClient() as cclient:
+                            await cclient.post(
+                                f"{CACHE_URL}/cache/photo/{photo_id}",
+                                content=resp.content,
+                                timeout=5.0
+                            )
+                            logger.debug(f"[READ] Cached photo {photo_id}")
+                    except Exception as e:
+                        logger.warning(f"[READ] Failed to cache photo {photo_id}: {e}")
+
+                    return Response(content=resp.content, media_type="application/octet-stream")
+            except Exception as e:
+                logger.warning(f"[READ] Store {store} failed: {e}")
+                continue
+
+        logger.error(f"[READ] All replicas failed for photo {photo_id}")
+        raise HTTPException(status_code=503, detail="All replicas failed to serve photo")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[READ] UNEXPECTED ERROR: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Read failed due to unexpected error")
+
+
+# ============================================
+# DELETE ENDPOINT
+# ============================================
+
+@app.delete("/photo/{photo_id}")
+async def delete_photo(photo_id: int):
+    """
+    Delete a photo: directory soft-delete -> delete from all stores -> cache purge
+    """
+    logger.info(f"[DELETE] Starting delete for photo_id={photo_id}")
+    
+    try:
+        # 1) Locate Primary Directory
+        logger.info(f"[DELETE] Step 1: Querying Discovery for Directory leader")
+        directory_leader_url = await _get_directory_leader_url()
+        
+        # 2) Directory lookup
+        logger.info(f"[DELETE] Step 2: Fetching metadata from Directory")
+        async with httpx.AsyncClient() as dclient:
+            r = await dclient.get(f"{directory_leader_url}/photo/{photo_id}")
+        
+        if r.status_code != 200:
+            logger.error(f"[DELETE] Photo {photo_id} not found")
+            raise HTTPException(status_code=404, detail="photo not found")
+
+        meta = r.json()
+        logical_volume = meta["logical_volume"]
+        replicas = meta["replicas"]
+        
+        logger.info(f"[DELETE] Step 2 Complete: lv={logical_volume}, replicas={replicas}")
+
+        # 3) Mark deleted in Directory Primary
+        logger.info(f"[DELETE] Step 3: Marking photo as deleted in Directory")
+        async with httpx.AsyncClient() as pclient:
+            rd = await pclient.post(f"{directory_leader_url}/delete", json={"photo_id": photo_id})
+        
+        if rd.status_code != 200:
+            logger.error(f"[DELETE] Directory delete failed: {rd.status_code}")
+            raise HTTPException(status_code=500, detail="directory delete failed")
+
+        logger.info(f"[DELETE] Step 3 Complete: Directory marked as deleted")
+
+        # 4) Delete from ALL stores (Best effort)
+        logger.info(f"[DELETE] Step 4: Deleting from {len(replicas)} store(s)")
+        failed: List[str] = []
+        
+        for idx, store in enumerate(replicas):
+            store_url = make_store_url(store)
+            logger.info(f"[DELETE] Step 4.{idx+1}/{len(replicas)}: Deleting from {store}")
+            
+            try:
+                async with httpx.AsyncClient() as sclient:
+                    r2 = await sclient.post(
+                        f"{store_url}/volume/{logical_volume}/delete",
+                        json={"photo_id": photo_id},
+                        timeout=5.0
+                    )
+                
+                if r2.status_code != 200:
+                    logger.warning(f"[DELETE] Store {store} delete failed: {r2.status_code}")
+                    failed.append(store)
+                else:
+                    logger.info(f"[DELETE] Store {store} delete successful")
+            except Exception as e:
+                logger.warning(f"[DELETE] Exception with store {store}: {e}")
+                failed.append(store)
+
+        logger.info(f"[DELETE] Step 4 Complete: Delete attempts complete (failed={failed})")
+
+        # 5) Purge cache
+        logger.info(f"[DELETE] Step 5: Purging from cache")
+        try:
+            async with httpx.AsyncClient() as cclient:
+                await cclient.delete(f"{CACHE_URL}/cache/photo/{photo_id}", timeout=3.0)
+            logger.info(f"[DELETE] Step 5 Complete: Cache purged")
+        except Exception as e:
+            logger.warning(f"[DELETE] Cache purge failed: {e}")
+
+        logger.info(f"[DELETE] SUCCESS: photo_id={photo_id}, failed_replicas={failed}")
+        return {"status": "deleted", "failed_replicas": failed}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[DELETE] UNEXPECTED ERROR: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Delete failed due to unexpected error")
+
+
+# ============================================
+# SIMILARITY SEARCH ENDPOINT
+# ============================================
+
+@app.post("/find_similar")
+async def find_similar(file: UploadFile = File(...), k: int = Form(5)):
+    """
+    Find similar photos: forward to similarity service
+    """
+    logger.info(f"[FIND_SIMILAR] Starting search for {file.filename} with k={k}")
+    
+    try:
+        # 1. Read file content
+        logger.info(f"[FIND_SIMILAR] Step 1: Reading query file")
+        try:
+            content = await file.read()
+            logger.info(f"[FIND_SIMILAR] Step 1 Complete: Read {len(content)} bytes")
+        except Exception as e:
+            logger.error(f"[FIND_SIMILAR] Failed to read file: {e}")
+            raise HTTPException(status_code=500, detail="Failed to read query file content.")
+        
+        # 2. Send to similarity service
+        logger.info(f"[FIND_SIMILAR] Step 2: Forwarding to similarity service")
+        async with httpx.AsyncClient() as client:
+            form_data = {'k': str(k)}
+            files = {'file': (file.filename, content, file.content_type)}
+            
+            r_sim = await client.post(
+                f"{SIMILARITY_URL}/find_similar/",
+                data=form_data,
+                files=files,
+                timeout=60.0
+            )
+            
+            if r_sim.status_code == 200:
+                logger.info(f"[FIND_SIMILAR] SUCCESS: Received results from similarity service")
+                return r_sim.json()
+            else:
+                logger.error(f"[FIND_SIMILAR] Similarity service error: {r_sim.status_code} - {r_sim.text}")
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Similarity Service Error: {r_sim.status_code}"
+                )
+
+    except httpx.RequestError as e:
+        logger.error(f"[FIND_SIMILAR] Network error: {e}")
+        raise HTTPException(status_code=503, detail=f"Cannot reach similarity service")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[FIND_SIMILAR] UNEXPECTED ERROR: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Search failed due to unexpected error")
+
+
+# ============================================
+# HEALTH CHECK
+# ============================================
+
+@app.get("/health")
+def health():
+    """Health check endpoint"""
+    logger.debug("Health check requested")
+    return {"status": "ok", "service": "api-gateway"}
+
+
+# ============================================
+# STARTUP/SHUTDOWN
+# ============================================
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("API Gateway startup complete")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("API Gateway shutting down")
+
+
+# ============================================
+# MAIN
+# ============================================
+
+if __name__ == "__main__":
+    logger.info("Starting API Gateway with Uvicorn...")
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_config=None)
+================================================================================
+
+FILE PATH: services\api\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn[standard]
+httpx
+pika
+python-multipart
+pydantic
+pika
+================================================================================
+
+FILE PATH: services\cache\Dockerfile
+--------------------------------------------------------------------------------
+# ...existing code...
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY services/cache/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+RUN mkdir -p data/cache
+
+# Ensure the whole services package is present so imports like "services.cache.main" work
+COPY services /app/services
+
+COPY services/cache/main.py .
+
+ENV PORT=8201
+
+CMD ["uvicorn", "services.cache.main:app", "--host", "0.0.0.0", "--port", "8201"]
+# ...existing code...
+================================================================================
+
+FILE PATH: services\cache\main.py
+--------------------------------------------------------------------------------
+"""
+Haystack Cache Service
+----------------------
+
+This Cache stores raw photo bytes identified by photo_id.
+Cache semantics match Haystack-style caching:
+- Cache stores recently-read or recently-uploaded items.
+- Does NOT store offsets or anything Haystack-specific.
+- TTL + LRU eviction + size limit.
+- Cache is best-effort. Failures MUST NOT break the system.
+
+Endpoints:
+    GET    /cache/exists/{photo_id}
+    GET    /cache/photo/{photo_id}
+    POST   /cache/photo/{photo_id}
+    DELETE /cache/photo/{photo_id}
+    GET    /cache/stats
+    GET    /health
+"""
+
+import os
+import time
+import json
+import asyncio
+import logging
+from typing import Dict
+from collections import OrderedDict
+from fastapi import FastAPI, HTTPException, Request, Response
+import uvicorn
+
+# ------------------------------------------
+# Logging
+# ------------------------------------------
+
+import os
+
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+CACHE_LOG_FILE = os.path.join(LOG_DIR, "cache.log")
+
+# Configure root logger only if not already configured
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+if not any(isinstance(h, logging.FileHandler) and getattr(h, 'baseFilename', None) == os.path.abspath(CACHE_LOG_FILE) for h in root_logger.handlers):
+    fh = logging.FileHandler(CACHE_LOG_FILE)
+    fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s [CACHE]: %(message)s'))
+    root_logger.addHandler(fh)
+
+logger = logging.getLogger("haystack-cache")
+
+# ------------------------------------------
+# Configuration
+# ------------------------------------------
+
+DATA_DIR = os.environ.get("CACHE_DATA_DIR", "./data/cache")
+os.makedirs(DATA_DIR, exist_ok=True)
+
+MAX_CACHE_SIZE_BYTES = int(os.environ.get("MAX_CACHE_SIZE_BYTES", 10 * 1024 * 1024))  # 10 MB
+MAX_ITEMS = int(os.environ.get("MAX_CACHE_ITEMS", 20))
+TTL_SEC = int(os.environ.get("CACHE_TTL_SEC", 60))
+SWEEP_INTERVAL = int(os.environ.get("CACHE_SWEEP_SEC", 10))
+
+logger.info(f"Cache dir={DATA_DIR}, max_bytes={MAX_CACHE_SIZE_BYTES}, max_items={MAX_ITEMS}, ttl={TTL_SEC}")
+
+# ------------------------------------------
+# In-memory Cache: OrderedDict = LRU
+# ------------------------------------------
+
+cache_index: "OrderedDict[int, dict]" = OrderedDict()
+total_cache_bytes = 0
+
+# ------------------------------------------
+# Helpers
+# ------------------------------------------
+
+def now():
+    return time.time()
+
+def file_path(photo_id: int):
+    return os.path.join(DATA_DIR, f"{photo_id}.bin")
+
+def is_expired(meta):
+    return meta["expiry"] < now()
+
+def touch(photo_id: int):
+    """Refresh TTL and move to MRU."""
+    try:
+        meta = cache_index.pop(photo_id)
+        meta["last_access"] = now()
+        meta["expiry"] = now() + TTL_SEC
+        cache_index[photo_id] = meta
+        return True
+    except KeyError:
+        return False
+
+def remove_from_cache(photo_id: int):
+    """Remove metadata and file."""
+    global total_cache_bytes
+
+    meta = cache_index.pop(photo_id, None)
+    if meta:
+        total_cache_bytes -= meta["size"]
+
+    path = file_path(photo_id)
+    if os.path.exists(path):
+        try:
+            os.remove(path)
+        except Exception:
+            pass
+
+def evict_if_needed():
+    """Evict expired items first, then LRU/size-based."""
+    global total_cache_bytes
+
+    evicted = []
+
+    # 1) Expired eviction
+    for pid in list(cache_index.keys()):
+        meta = cache_index.get(pid)
+        if meta and is_expired(meta):
+            remove_from_cache(pid)
+            evicted.append(pid)
+
+    # 2) Size or count eviction
+    while total_cache_bytes > MAX_CACHE_SIZE_BYTES or len(cache_index) > MAX_ITEMS:
+        if not cache_index:
+            break
+        pid, _ = cache_index.popitem(last=False)  # LRU eviction
+        remove_from_cache(pid)
+        evicted.append(pid)
+
+    return evicted
+
+# ------------------------------------------
+# Background Sweeper
+# ------------------------------------------
+
+async def sweep_loop():
+    logger.info("Cache sweep loop started.")
+    while True:
+        try:
+            evicted = evict_if_needed()
+            if evicted:
+                logger.info(f"Swept {len(evicted)} items: {evicted}")
+        except Exception as e:
+            logger.exception(f"Error during sweep: {e}")
+        await asyncio.sleep(SWEEP_INTERVAL)
+
+# ------------------------------------------
+# Startup & Shutdown
+# ------------------------------------------
+
+app = FastAPI(title="Haystack Cache")
+
+@app.on_event("startup")
+async def startup():
+    logger.info("Cache service starting...")
+    app.state.sweeper = asyncio.create_task(sweep_loop())
+
+@app.on_event("shutdown")
+async def shutdown():
+    logger.info("Stopping cache service...")
+    sweeper = getattr(app.state, "sweeper", None)
+    if sweeper:
+        sweeper.cancel()
+        try:
+            await sweeper
+        except asyncio.CancelledError:
+            pass
+
+# ------------------------------------------
+# API Endpoints
+# ------------------------------------------
+
+@app.get("/cache/exists/{photo_id}")
+def exists(photo_id: int):
+    meta = cache_index.get(photo_id)
+    if not meta:
+        return {"exists": False}
+    if is_expired(meta):
+        remove_from_cache(photo_id)
+        return {"exists": False}
+    return {"exists": True, "size": meta["size"]}
+
+@app.get("/cache/photo/{photo_id}")
+def get_photo(photo_id: int):
+    meta = cache_index.get(photo_id)
+    if not meta:
+        raise HTTPException(status_code=404, detail="cache miss")
+
+    if is_expired(meta):
+        remove_from_cache(photo_id)
+        raise HTTPException(status_code=404, detail="expired")
+
+    # refresh TTL + move to MRU
+    touch(photo_id)
+
+    path = meta["path"]
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+        return Response(content=data, media_type="application/octet-stream")
+    except Exception:
+        remove_from_cache(photo_id)
+        raise HTTPException(status_code=404, detail="file missing")
+
+@app.post("/cache/photo/{photo_id}")
+async def put_photo(photo_id: int, request: Request):
+    global total_cache_bytes
+
+    body = await request.body()
+    size = len(body)
+
+    if size == 0:
+        raise HTTPException(status_code=400, detail="empty body")
+
+    path = file_path(photo_id)
+    tmp = path + ".tmp"
+
+    # atomic write
+    try:
+        with open(tmp, "wb") as f:
+            f.write(body)
+        os.replace(tmp, path)
+    except Exception as e:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+        raise HTTPException(status_code=500, detail=f"write failed: {e}")
+
+    # update in-memory index
+    old = cache_index.pop(photo_id, None)
+    if old:
+        total_cache_bytes -= old["size"]
+
+    meta = {
+        "path": path,
+        "size": size,
+        "last_access": now(),
+        "expiry": now() + TTL_SEC
+    }
+    cache_index[photo_id] = meta
+    total_cache_bytes += size
+
+    # enforce eviction
+    evict_if_needed()
+
+    return {"status": "stored", "photo_id": photo_id, "size": size}
+
+@app.delete("/cache/photo/{photo_id}")
+def delete_photo(photo_id: int):
+    if photo_id not in cache_index:
+        # best-effort: still attempt file removal
+        path = file_path(photo_id)
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except:
+                pass
+        return {"status": "not_found"}
+
+    remove_from_cache(photo_id)
+    return {"status": "deleted", "photo_id": photo_id}
+
+@app.get("/cache/stats")
+def stats():
+    return {
+        "items": len(cache_index),
+        "bytes": total_cache_bytes,
+        "max_bytes": MAX_CACHE_SIZE_BYTES,
+        "max_items": MAX_ITEMS,
+        "ttl": TTL_SEC
+    }
+
+@app.get("/health")
+def health():
+    return {"status": "ok", "items": len(cache_index)}
+
+if __name__ == "__main__":
+    logger.info("Starting Cache server...")
+    uvicorn.run(app, host="0.0.0.0")
+
+================================================================================
+
+FILE PATH: services\cache\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn[standard]
+pydantic
+================================================================================
+
+FILE PATH: services\directory\Dockerfile
+--------------------------------------------------------------------------------
+# ...existing code...
+FROM python:3.11-slim
+
+RUN apt-get update && \
+    apt-get install -y sqlite3 && \
+    rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY services/directory/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+RUN mkdir -p data
+
+# Add the whole services package so "services.directory.main" imports work
+COPY services /app/services
+
+COPY services/directory/main.py .
+COPY services/directory/models.py .
+
+CMD ["uvicorn", "services.directory.main:app", "--host", "0.0.0.0", "--port", "8001"]
+# ...existing code...
+================================================================================
+
+FILE PATH: services\directory\main.py
+--------------------------------------------------------------------------------
+"""
+Haystack-style Directory FastAPI app.
+
+DIRECTORY MODE LOGIC:
+- Uses Discovery Service to manage its mode (primary/replica).
+- Periodically registers its status.
+
+REPLICATION LOGIC (ASYNC):
+- Primary (only) publishes all DB changes to RabbitMQ for Replicas to consume.
+"""
+
+import os
+import sys
+import time
+import asyncio
+import httpx
+import logging
+import uvicorn
+from typing import Optional
+import pika # NEW: Import pika for RabbitMQ
+import json   # REQUIRED for message payload
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+import services.directory.models as models
+from typing import List, Dict, Any
+
+# ============================================
+# LOGGING CONFIGURATION (User's Detailed Setup - RETAINED)
+# ============================================
+
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+DIRECTORY_LOG_FILE = os.path.join(LOG_DIR, "directory.log")
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Remove any existing handlers to avoid duplicates
+for handler in root_logger.handlers[:]:
+    root_logger.removeHandler(handler)
+
+# Add file handler
+file_handler = logging.FileHandler(DIRECTORY_LOG_FILE)
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('[%(asctime)s] %(levelname)s - %(name)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+root_logger.addHandler(file_handler)
+
+# Add console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('[%(asctime)s] %(levelname)s - %(name)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+root_logger.addHandler(console_handler)
+
+# Get logger for this module
+logger = logging.getLogger(__name__)
+
+logger.info("=" * 60)
+logger.info("Directory Service Starting")
+logger.info(f"Log file: {DIRECTORY_LOG_FILE}")
+logger.info("=" * 60)
+
+# ============================================
+# FASTAPI APP INITIALIZATION
+# ============================================
+
+app = FastAPI(title="Directory Service")
+
+# Initialize DB on startup
+logger.info("Initializing database...")
+try:
+    models.init_db()
+    logger.info("Database initialization successful")
+except Exception as e:
+    logger.error(f"Database initialization failed: {e}", exc_info=True)
+    raise
+
+# ============================================
+# ENVIRONMENT VARIABLES & RABBITMQ SETUP
+# ============================================
+
+# NOTE: DIRECTORY_MODE will be dynamically managed by the discovery loop
+DIRECTORY_MODE = os.environ.get("DIRECTORY_MODE", "primary") 
+DISCOVERY_SERVICE_URL = os.environ.get("DISCOVERY_SERVICE_URL", "http://discovery:8501")
+SERVICE_NAME = os.environ.get("HOSTNAME", f"directory_{DIRECTORY_MODE}")
+AVAILABLE_STORES_RAW = os.environ.get("AVAILABLE_STORES", "store1,store2")
+AVAILABLE_STORES = [s.strip() for s in AVAILABLE_STORES_RAW.split(',') if s.strip()]
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/") # NEW
+
+REGISTRATION_INTERVAL = int(os.environ.get("REGISTRATION_INTERVAL", "5"))
+INITIAL_VOLUME_ID = "lv-1"
+
+logger.info(f"Service Name: {SERVICE_NAME}")
+logger.info(f"Mode: {DIRECTORY_MODE}")
+logger.info(f"Available Stores for Volume: {AVAILABLE_STORES}")
+logger.info(f"RabbitMQ URL: {RABBITMQ_URL}")
+
+# Global RabbitMQ connection (used by publisher)
+RABBITMQ_CONNECTION: Optional[pika.BlockingConnection] = None
+RABBITMQ_CHANNEL: Optional[pika.channel.Channel] = None
+
+
+# --------------------------------------------
+# RabbitMQ Publisher Logic (Primary Only)
+# --------------------------------------------
+
+def setup_rabbitmq_publisher():
+    """Initializes a blocking connection and channel for publishing events."""
+    global RABBITMQ_CONNECTION, RABBITMQ_CHANNEL
+    try:
+        if RABBITMQ_CONNECTION and RABBITMQ_CONNECTION.is_open:
+            return
+
+        params = pika.URLParameters(RABBITMQ_URL)
+        RABBITMQ_CONNECTION = pika.BlockingConnection(params)
+        RABBITMQ_CHANNEL = RABBITMQ_CONNECTION.channel()
+        
+        # Declare the exchange used for directory updates (durable topic exchange)
+        RABBITMQ_CHANNEL.exchange_declare(
+            exchange='directory.updates', 
+            exchange_type='topic', 
+            durable=True
+        )
+        logger.info("RabbitMQ publisher connection established.")
+    except Exception as e:
+        logger.error(f"Failed to set up RabbitMQ publisher: {e}", exc_info=True)
+        RABBITMQ_CONNECTION = None
+        RABBITMQ_CHANNEL = None
+
+
+def close_rabbitmq_publisher():
+    """Closes the RabbitMQ connection."""
+    global RABBITMQ_CONNECTION, RABBITMQ_CHANNEL
+    if RABBITMQ_CONNECTION and RABBITMQ_CONNECTION.is_open:
+        RABBITMQ_CONNECTION.close()
+        logger.info("RabbitMQ publisher connection closed.")
+    RABBITMQ_CONNECTION = None
+    RABBITMQ_CHANNEL = None
+
+
+def publish_directory_update(operation: str, payload: Dict[str, Any]):
+    """Publishes a structured update message to the directory.updates exchange."""
+    if DIRECTORY_MODE != 'primary':
+        return # Only the primary publishes updates
+
+    if not RABBITMQ_CHANNEL:
+        logger.warning(f"RabbitMQ channel not available for {operation}. Attempting reconnect.")
+        setup_rabbitmq_publisher()
+        if not RABBITMQ_CHANNEL:
+            logger.error(f"Failed to publish {operation}: RabbitMQ unavailable.")
+            return
+
+    try:
+        routing_key = f"dir.{operation.lower()}"
+        message = {
+            "operation": operation,
+            "timestamp": time.time(),
+            "source": SERVICE_NAME,
+            "payload": payload
+        }
+        
+        RABBITMQ_CHANNEL.basic_publish(
+            exchange='directory.updates',
+            routing_key=routing_key,
+            body=json.dumps(message),
+            properties=pika.BasicProperties(delivery_mode=2) # Persistent message
+        )
+        logger.info(f"Published update: {routing_key} for photo {payload.get('photo_id')}")
+        
+    except pika.exceptions.AMQPConnectionError:
+        logger.error("RabbitMQ connection lost. Reconnecting...")
+        close_rabbitmq_publisher()
+    except Exception as e:
+        logger.error(f"Failed to publish {operation} message: {e}", exc_info=True)
+
+
+# -----------------------
+# Request Models
+# -----------------------
+
+class AllocateReq(BaseModel):
+    size: int
+    alt_key: str | None = "orig"
+
+
+class AllocateResp(BaseModel):
+    photo_id: int
+    logical_volume: str
+    cookie: str
+    replicas: list[str]
+
+
+class CommitReq(BaseModel):
+    photo_id: int
+
+
+class DeleteReq(BaseModel):
+    photo_id: int
+
+
+# --------------------------------------------
+# Initialization and Discovery Logic
+# --------------------------------------------
+
+def check_and_initialize_volume():
+    """
+    On startup, ensure a writable volume exists. 
+    This must be run synchronously by ALL instances.
+    """
+    logger.info(f"Checking for initial volume '{INITIAL_VOLUME_ID}'...")
+    
+    if not models.volume_exists(INITIAL_VOLUME_ID):
+        logger.info(f"Initial volume '{INITIAL_VOLUME_ID}' does not exist. Creating...")
+        
+        if not AVAILABLE_STORES:
+            error_msg = "No AVAILABLE_STORES defined to create initial volume"
+            logger.error(error_msg)
+            raise RuntimeError(error_msg)
+        
+        try:
+            models.insert_new_volume(INITIAL_VOLUME_ID, AVAILABLE_STORES)
+            logger.info(f"Created initial volume '{INITIAL_VOLUME_ID}' with replicas: {AVAILABLE_STORES}")
+        except Exception as e:
+            if not models.volume_exists(INITIAL_VOLUME_ID):
+                logger.error(f"Failed to insert initial volume: {e}", exc_info=True)
+                raise
+            else:
+                logger.info(f"Volume already exists (created by another instance)")
+    else:
+        logger.info(f"Initial volume '{INITIAL_VOLUME_ID}' already exists")
+
+
+async def register_and_check_promotion():
+    """
+    Periodically registers with the Discovery Service and checks if this instance
+    has been declared the new leader, updating the global state.
+    """
+    global DIRECTORY_MODE 
+    
+    internal_url = f"http://{SERVICE_NAME}:8001"
+    
+    while True:
+        try:
+            async with httpx.AsyncClient() as client:
+                
+                # 1. Registration: Tell the DS our current role and health
+                reg_payload = {
+                    "url": internal_url,
+                    "mode": DIRECTORY_MODE,
+                    "health": "ok"
+                }
+                await client.post(f"{DISCOVERY_SERVICE_URL}/register/{SERVICE_NAME}", 
+                                  json=reg_payload, timeout=3.0)
+                
+                # 2. Promotion Check: Ask the DS who the current leader is
+                leader_r = await client.get(f"{DISCOVERY_SERVICE_URL}/leader", timeout=3.0)
+                
+                if leader_r.status_code == 200:
+                    leader_data = leader_r.json()
+                    
+                    if leader_data.get('service_name') == SERVICE_NAME and DIRECTORY_MODE != 'primary':
+                        # CRITICAL: DS has promoted us! Change internal state.
+                        DIRECTORY_MODE = "primary"
+                        logger.critical(">>> PROMOTION SUCCESSFUL: I AM NOW THE PRIMARY LEADER <<<")
+                        setup_rabbitmq_publisher() # NEW: Setup publisher upon taking leadership
+                        
+                    elif leader_data.get('service_name') != SERVICE_NAME and DIRECTORY_MODE == 'primary':
+                        # Fencing/Demotion: Another instance was elected. Step down.
+                        DIRECTORY_MODE = "replica"
+                        logger.warning("<<< DEMOTION OCCURRED: Another service was elected Primary. I am now a Replica. >>>")
+                        close_rabbitmq_publisher() # NEW: Close publisher upon demotion
+                        
+                    elif leader_data.get('service_name') != SERVICE_NAME:
+                         logger.info(f"Primary is {leader_data.get('service_name')}. Running as {DIRECTORY_MODE}.")
+                
+        except httpx.RequestError as e:
+            logger.error(f"Network error during discovery operation: {e}")
+        except asyncio.CancelledError:
+            logger.info("Discovery registration task cancelled")
+            break
+        except Exception as e:
+            logger.exception(f"Unexpected error during discovery loop: {e}")
+        
+        try:
+            await asyncio.sleep(REGISTRATION_INTERVAL)
+        except asyncio.CancelledError:
+            break
+
+# --------------------------------------------
+# Initial Sync and Consumption Logic (To be built later for Replicas)
+# --------------------------------------------
+
+
+# -----------------------
+# Startup & Shutdown Hooks
+# -----------------------
+
+@app.on_event("startup")
+async def startup_event():
+    logger.info("Startup event triggered")
+    
+    # 1. Ensure the initial logical volume is ready in the shared DB
+    try:
+        logger.info("Initializing volumes...")
+        check_and_initialize_volume()
+        logger.info("Volume initialization successful")
+    except RuntimeError as e:
+        logger.error(f"FATAL DIRECTORY ERROR during volume initialization: {e}", exc_info=True)
+        raise
+    
+    # 2. Setup RabbitMQ publisher if we start as primary (Initial state)
+    if DIRECTORY_MODE == 'primary':
+        setup_rabbitmq_publisher()
+    
+    # 3. Start the periodic registration and promotion check task
+    logger.info(f"Starting periodic discovery registration task for {SERVICE_NAME}...")
+    try:
+        app.state.discovery_task = asyncio.create_task(register_and_check_promotion())
+        logger.info(f"Directory service started successfully in {DIRECTORY_MODE} mode")
+    except Exception as e:
+        logger.error(f"Failed to start discovery registration task: {e}", exc_info=True)
+        raise
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    logger.info("Shutdown event triggered")
+    
+    # 1. Close RabbitMQ publisher connection
+    close_rabbitmq_publisher()
+
+    # 2. Cancel the periodic registration task
+    if hasattr(app.state, 'discovery_task'):
+        logger.info("Cancelling discovery registration task...")
+        app.state.discovery_task.cancel()
+        try:
+            await app.state.discovery_task
+        except asyncio.CancelledError:
+            logger.info("Discovery registration task cancelled successfully")
+    
+    logger.info("Directory service shutdown complete")
+
+
+# -----------------------
+# WRITE Endpoints (Primary Only Enforcement)
+# -----------------------
+
+def ensure_primary():
+    """Ensure this instance is in primary mode for write operations."""
+    if DIRECTORY_MODE != "primary":
+        logger.warning(f"Write attempt on {DIRECTORY_MODE} instance (only primary accepts writes)")
+        raise HTTPException(
+            status_code=405,
+            detail=f"This directory instance is a '{DIRECTORY_MODE}' and does not accept writes."
+        )
+
+
+@app.post("/allocate_write", response_model=AllocateResp)
+def allocate(req: AllocateReq):
+    """
+    Allocate a new photo ID and return write location.
+    Only available on primary instance.
+    """
+    logger.info(f"[ALLOCATE] size={req.size}, alt_key={req.alt_key}")
+    
+    try:
+        ensure_primary()
+        logger.debug(f"[ALLOCATE] Primary mode verified")
+        
+        # NOTE: Pass AVAILABLE_STORES to models layer for potential LV rollover
+        r = models.allocate_write(req.size, req.alt_key or "orig", available_stores=AVAILABLE_STORES)
+        
+        # --- 1. Update Volume Usage (Simulated Write) ---
+        try:
+            models.update_volume_usage(r["logical_volume"], req.size)
+            logger.info(f"[ALLOCATE] Volume usage updated for {r['logical_volume']}")
+        except Exception as update_e:
+            logger.error(f"[ALLOCATE] FAILED to update volume usage: {update_e}", exc_info=True)
+
+        # --- 2. Publish Allocation Event ---
+        publish_directory_update("ALLOCATE", {
+            "photo_id": r["photo_id"],
+            "logical_volume": r["logical_volume"],
+            "replicas": r["replicas"],
+            "cookie": r["cookie"],
+            "alt_key": req.alt_key or "orig",
+            "size": req.size,
+            "status": "alloc"
+        })
+
+        logger.info(f"[ALLOCATE] SUCCESS: photo_id={r['photo_id']}, lv={r['logical_volume']}, replicas={r['replicas']}")
+        
+        return r
+        
+    except HTTPException as e:
+        logger.error(f"[ALLOCATE] HTTP Exception: {e.status_code} - {e.detail}")
+        raise
+    except RuntimeError as e:
+        logger.error(f"[ALLOCATE] Allocation failed: {e}")
+        raise HTTPException(status_code=503, detail="No writable volume available for allocation.")
+    except Exception as e:
+        logger.error(f"[ALLOCATE] Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/commit_write")
+def commit(req: CommitReq):
+    """
+    Commit a write operation (mark photo as active).
+    Only available on primary instance.
+    """
+    logger.info(f"[COMMIT] photo_id={req.photo_id}")
+    
+    try:
+        ensure_primary()
+        logger.debug(f"[COMMIT] Primary mode verified")
+        
+        result = models.commit_write(req.photo_id)
+        
+        # --- Publish Commit Event ---
+        publish_directory_update("COMMIT", {
+            "photo_id": req.photo_id,
+            "status": "active"
+        })
+        
+        logger.info(f"[COMMIT] SUCCESS: photo_id={req.photo_id}")
+        return result
+        
+    except HTTPException as e:
+        logger.error(f"[COMMIT] HTTP Exception: {e.status_code} - {e.detail}")
+        raise
+    except Exception as e:
+        logger.error(f"[COMMIT] Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/delete")
+def delete(req: DeleteReq):
+    """
+    Mark a photo as deleted (soft delete).
+    Only available on primary instance.
+    """
+    logger.info(f"[DELETE] photo_id={req.photo_id}")
+    
+    try:
+        ensure_primary()
+        logger.debug(f"[DELETE] Primary mode verified")
+        
+        result = models.mark_deleted(req.photo_id)
+        
+        # --- Publish Delete Event ---
+        publish_directory_update("DELETE", {
+            "photo_id": req.photo_id
+        })
+        
+        logger.info(f"[DELETE] SUCCESS: photo_id={req.photo_id}")
+        return result
+        
+    except HTTPException as e:
+        logger.error(f"[DELETE] HTTP Exception: {e.status_code} - {e.detail}")
+        raise
+    except Exception as e:
+        logger.error(f"[DELETE] Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------
+# READ Endpoints (Primary or Replica)
+# -----------------------
+
+@app.get("/photo/{photo_id}")
+def get_photo(photo_id: int):
+    """
+    Retrieve photo metadata.
+    Available on both primary and replica instances.
+    """
+    logger.debug(f"[GET_PHOTO] photo_id={photo_id}")
+    
+    try:
+        p = models.get_photo(photo_id)
+        
+        if not p:
+            logger.warning(f"[GET_PHOTO] photo_id={photo_id} not found")
+            raise HTTPException(status_code=404, detail="photo not found")
+        
+        logger.debug(f"[GET_PHOTO] SUCCESS: photo_id={photo_id}")
+        return p
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[GET_PHOTO] Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/photos")
+def list_photos():
+    """
+    List all photos.
+    Available on both primary and replica instances.
+    """
+    logger.debug("[LIST_PHOTOS] Listing all photos")
+    
+    try:
+        result = models.list_all_photos()
+        logger.debug(f"[LIST_PHOTOS] Returned {result.get('total', 0)} photos")
+        return result
+        
+    except Exception as e:
+        logger.error(f"[LIST_PHOTOS] Unexpected error: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# -----------------------
+# HEALTH CHECK & STATUS
+# -----------------------
+
+@app.get("/health")
+def health():
+    """
+    Health check endpoint.
+    Available on both primary and replica instances.
+    """
+    logger.debug("[HEALTH] Health check requested")
+    
+    db_path = os.environ.get("DB_PATH", "data/directory.db")
+    db_exists = os.path.exists(db_path)
+    
+    return {
+        "service": "directory",
+        "mode": DIRECTORY_MODE,
+        "db_path": db_path,
+        "db_exists": db_exists,
+        "timestamp": time.time()
+    }
+
+
+@app.get("/status")
+def status():
+    """
+    Detailed status endpoint.
+    Available on both primary and replica instances.
+    """
+    logger.debug("[STATUS] Status check requested")
+    
+    try:
+        photos = models.list_all_photos()
+        
+        return {
+            "service": "directory",
+            "mode": DIRECTORY_MODE,
+            "total_photos": photos.get('total', 0),
+            "timestamp": time.time(),
+            "status": "ok"
+        }
+    except Exception as e:
+        logger.error(f"[STATUS] Error retrieving status: {e}", exc_info=True)
+        return {
+            "service": "directory",
+            "mode": DIRECTORY_MODE,
+            "status": "error",
+            "error": str(e)
+        }
+
+
+# --------------------------------------------
+# EXPORT ENDPOINT (For Replica Bootstrapping)
+# --------------------------------------------
+
+@app.get("/sync/full-dump")
+def get_full_data_dump():
+    """
+    Retrieves all photo metadata. Used by new Replicas for bootstrapping history.
+    """
+    if DIRECTORY_MODE != 'primary':
+        raise HTTPException(status_code=405, detail="Only Primary can provide the full data dump.")
+        
+    try:
+        data = models.list_all_photos_data() # New function in models.py
+        logger.info(f"Exported {len(data)} photo records for snapshot sync.")
+        return data
+    except Exception as e:
+        logger.error(f"Failed to generate full data dump: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Database read error during export.")
+
+
+# ============================================
+# MAIN
+# ============================================
+
+if __name__ == "__main__":
+    logger.info("=" * 60)
+    logger.info("Starting Directory Service with Uvicorn")
+    logger.info(f"Host: 0.0.0.0, Port: {os.getenv('PORT', '8001')}")
+    logger.info(f"Mode: {DIRECTORY_MODE}")
+    logger.info("=" * 60)
+    
+    # We pass log_config=None because we handle all logging setup above via the root_logger
+    port = int(os.getenv("PORT", "8001"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_config=None)
+================================================================================
+
+FILE PATH: services\directory\models.py
+--------------------------------------------------------------------------------
+"""
+Directory models and DB helpers (Haystack-style).
+
+Directory stores *only logical metadata*:
+- photo_id -> logical_volume, alt_key, cookie, status, replicas
+
+UPDATED LOGIC:
+- Supports updating volume usage (used_bytes).
+- Implements rollover logic in choose_volume_for_write: checks capacity,
+  marks old LV read-only, and creates the next sequential LV (lv-2, lv-3, etc.).
+- Adds synchronization helpers for bootstrapping new replicas (dump/sync).
+"""
+
+import sqlite3
+from contextlib import closing
+import os
+import json
+import logging
+from typing import List, Dict, Any, Tuple
+import re # Added for sequential LV ID generation
+
+logging.basicConfig(level=logging.INFO)
+
+DB = os.environ.get("DB_PATH", "data/directory.db")
+# Read LV_CAPACITY_BYTES from environment (defaults to 500 KB)
+DEFAULT_LV_CAPACITY_BYTES = int(os.environ.get("LV_CAPACITY_BYTES", 500000))
+
+
+# --------------------------------------------
+# INITIALIZATION
+# --------------------------------------------
+
+def init_db():
+    os.makedirs(os.path.dirname(DB) or ".", exist_ok=True)
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+
+        # Logical volumes: Capacity is set by f-string, resolving the sqlite3 error.
+        c.execute(f"""
+        CREATE TABLE IF NOT EXISTS volumes (
+            logical_volume TEXT PRIMARY KEY,
+            replicas TEXT NOT NULL,
+            capacity_bytes INTEGER DEFAULT {DEFAULT_LV_CAPACITY_BYTES},
+            used_bytes INTEGER DEFAULT 0,
+            is_writable INTEGER DEFAULT 1,
+            status TEXT DEFAULT 'active',
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        # Photos table creation remains the same
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS photos (
+            photo_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            logical_volume TEXT NOT NULL,
+            alt_key TEXT DEFAULT 'orig',
+            cookie TEXT,
+            replicas TEXT,
+            status TEXT DEFAULT 'alloc',  -- alloc -> pending append, active -> OK, deleted
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        # Replication state table (Optional)
+        c.execute("""
+        CREATE TABLE IF NOT EXISTS replication_state (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            photo_id INTEGER NOT NULL,
+            replica_node TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'pending',
+            attempts INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+        # Migration safety for alt_key
+        c.execute("PRAGMA table_info(photos)")
+        cols = [r[1] for r in c.fetchall()]
+        if "alt_key" not in cols:
+            logging.info("Adding alt_key column to photos")
+            c.execute("ALTER TABLE photos ADD COLUMN alt_key TEXT DEFAULT 'orig'")
+
+        conn.commit()
+
+
+# --------------------------------------------
+# INTERNAL HELPERS (LV Rollover and Usage)
+# --------------------------------------------
+
+def get_next_lv_id() -> str:
+    """Finds the largest existing LV ID (e.g., lv-1) and returns the next one (lv-2)."""
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT logical_volume FROM volumes ORDER BY logical_volume DESC LIMIT 1")
+        last_lv = c.fetchone()
+        
+        if last_lv:
+            match = re.match(r'lv-(\d+)', last_lv[0])
+            if match:
+                next_id = int(match.group(1)) + 1
+                return f"lv-{next_id}"
+        
+        return "lv-1" # Default if no volumes exist
+
+
+def update_volume_usage(logical_volume: str, size_to_add: int) -> bool:
+    """
+    Updates the used_bytes for the given volume. 
+    Returns True if update succeeded and False if the volume is now full (rollover needed).
+    """
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        
+        c.execute("SELECT used_bytes, capacity_bytes FROM volumes WHERE logical_volume = ?", (logical_volume,))
+        row = c.fetchone()
+        
+        if not row:
+            logging.warning(f"Attempted to update usage for non-existent volume: {logical_volume}")
+            return False
+
+        used, capacity = row
+        new_used = used + size_to_add
+        
+        # Haystack policy: Check if the new size exceeds 95% threshold 
+        if new_used > capacity * 0.95:
+            # Mark the volume as read-only (is_writable = 0)
+            c.execute("UPDATE volumes SET is_writable = 0, used_bytes = ? WHERE logical_volume = ?", 
+                      (new_used, logical_volume))
+            conn.commit()
+            logging.info(f"VOLUME FULL POLICY TRIGGERED: {logical_volume} marked read-only.")
+            return False # Rollover needed
+        
+        # Normal update
+        c.execute("UPDATE volumes SET used_bytes = ? WHERE logical_volume = ?", 
+                  (new_used, logical_volume))
+        conn.commit()
+        return True
+
+
+def insert_new_volume(logical_volume: str, replicas: List[str]):
+    """Inserts a new writable volume into the database."""
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        # Ensure capacity_bytes is set correctly
+        c.execute("INSERT INTO volumes (logical_volume, replicas, capacity_bytes) VALUES (?, ?, ?)",
+                  (logical_volume, ",".join(replicas), DEFAULT_LV_CAPACITY_BYTES))
+        conn.commit()
+    logging.info(f"Inserted new volume: {logical_volume} with replicas: {replicas}")
+
+
+def volume_exists(logical_volume: str) -> bool:
+    """Checks if a logical volume already exists."""
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT 1 FROM volumes WHERE logical_volume = ?", (logical_volume,))
+        return c.fetchone() is not None
+
+
+def choose_volume_for_write(size: int, available_stores: List[str]) -> dict:
+    """
+    Selects the current writable logical volume. If none exist, or if the current one
+    is full, it creates the next sequential LV.
+    """
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        
+        # 1. Find the current writable volume
+        c.execute("""
+            SELECT logical_volume, replicas, used_bytes, capacity_bytes
+            FROM volumes
+            WHERE is_writable = 1
+            LIMIT 1
+        """)
+        row = c.fetchone()
+        
+        # 2. Check if the current volume is nearing capacity
+        if row:
+            logical_volume, replicas_raw, used, capacity = row
+            
+            # Policy Check: If the current write would push us past the 95% threshold, trigger rollover
+            if used + size > capacity * 0.95:
+                logging.warning(f"LV {logical_volume} is too full (used={used}, cap={capacity}). Triggering rollover.")
+                
+                # Mark current volume as read-only
+                c.execute("UPDATE volumes SET is_writable = 0 WHERE logical_volume = ?", (logical_volume,))
+                conn.commit()
+                
+                row = None # Force creation of new LV
+            else:
+                 # If writable and not full, use it.
+                 return {
+                    "logical_volume": logical_volume,
+                    "replicas": replicas_raw.split(",")
+                 }
+
+        # 3. If no writable volume found (row is None), create a new one (LV rollover)
+        if not row:
+            if not available_stores:
+                 raise RuntimeError("No available physical stores to create a new logical volume.")
+
+            new_lv_id = get_next_lv_id()
+            
+            # Insert new volume and commit (using the model helper function)
+            insert_new_volume(new_lv_id, available_stores)
+            
+            logging.info(f"LV Rollover SUCCESS: Created new writable volume: {new_lv_id}")
+            
+            return {
+                "logical_volume": new_lv_id,
+                "replicas": available_stores
+            }
+            
+        raise RuntimeError("Volume selection logic failed.")
+
+
+# --------------------------------------------
+# WRITE: allocate_write
+# --------------------------------------------
+
+def allocate_write(size: int, alt_key: str = "orig", available_stores: List[str] = []) -> dict:
+    """
+    Main Haystack-style directory allocation:
+    - choose logical volume (and potentially trigger rollover)
+    """
+
+    from uuid import uuid4
+    cookie = uuid4().hex[:16]
+
+    # Uses the enhanced volume chooser
+    vol = choose_volume_for_write(size, available_stores)
+    logical_volume = vol["logical_volume"]
+    replicas = vol["replicas"]
+
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO photos (logical_volume, alt_key, cookie, replicas, status)
+            VALUES (?, ?, ?, ?, ?)
+        """, (logical_volume, alt_key, cookie, ",".join(replicas), "alloc"))
+
+        photo_id = c.lastrowid
+        conn.commit()
+
+    # Return EXACT fields expected by API Gateway
+    return {
+        "photo_id": photo_id,
+        "logical_volume": logical_volume,
+        "cookie": cookie,
+        "replicas": replicas
+    }
+
+
+# --------------------------------------------
+# WRITE: commit_write
+# --------------------------------------------
+
+def commit_write(photo_id: int):
+    """
+    After Stores append successfully, mark photo as active.
+    """
+
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+
+        c.execute("SELECT status FROM photos WHERE photo_id = ?", (photo_id,))
+        row = c.fetchone()
+        if not row:
+            raise RuntimeError("photo_id not found")
+
+        c.execute("UPDATE photos SET status = 'active' WHERE photo_id = ?", (photo_id,))
+        conn.commit()
+
+    return {"status": "committed", "photo_id": photo_id}
+
+
+# --------------------------------------------
+# READ: get_photo
+# --------------------------------------------
+
+def get_photo(photo_id: int) -> dict | None:
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+
+        c.execute("""
+            SELECT photo_id, logical_volume, alt_key, cookie, replicas, status
+            FROM photos
+            WHERE photo_id = ?
+        """, (photo_id,))
+
+        row = c.fetchone()
+        if not row:
+            return None
+
+        # Helper to convert SQLite row (tuple) to dictionary
+        columns = ["photo_id", "logical_volume", "alt_key", "cookie", "replicas", "status"]
+        result = dict(zip(columns, row))
+        
+        result["replicas"] = result["replicas"].split(",") if result["replicas"] else []
+        
+        return result
+
+
+# --------------------------------------------
+# WRITE: mark_deleted
+# --------------------------------------------
+
+def mark_deleted(photo_id: int):
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+
+        c.execute("SELECT status FROM photos WHERE photo_id = ?", (photo_id,))
+        if not c.fetchone():
+            raise RuntimeError("photo not found")
+
+        c.execute("""
+            UPDATE photos
+            SET status = 'deleted'
+            WHERE photo_id = ?
+        """, (photo_id,))
+
+        conn.commit()
+
+    return {"status": "deleted", "photo_id": photo_id}
+
+
+# --------------------------------------------
+# REPLICATION & SYNC HELPERS (NEW)
+# --------------------------------------------
+
+def get_all_photos_data() -> List[Dict[str, Any]]:
+    """Retrieves all photo records for a full data dump (Snapshot Sync)."""
+    with closing(sqlite3.connect(DB)) as conn:
+        conn.row_factory = sqlite3.Row # Allows fetching results by column name
+        c = conn.cursor()
+        c.execute("""
+            SELECT photo_id, logical_volume, alt_key, cookie, replicas, status, created_at
+            FROM photos
+        """)
+        
+        rows = c.fetchall()
+        
+        # Convert rows to a list of standard dictionaries
+        data_dump = []
+        for row in rows:
+            record = dict(row)
+            record["replicas"] = record["replicas"].split(",") if record["replicas"] else []
+            data_dump.append(record)
+            
+        return data_dump
+
+
+def sync_photos_from_dump(photo_dump: List[Dict[str, Any]]):
+    """
+    Inserts or replaces photo records from a full snapshot dump.
+    Used by a new Replica on startup.
+    """
+    if not photo_dump:
+        logging.info("Synchronization dump was empty. Skipping photo insertion.")
+        return
+
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        
+        # We use INSERT OR REPLACE to handle potential duplicates or overwriting old data
+        # during synchronization.
+        c.executemany("""
+            INSERT OR REPLACE INTO photos 
+            (photo_id, logical_volume, alt_key, cookie, replicas, status, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+        """, [
+            (
+                p['photo_id'], 
+                p['logical_volume'], 
+                p['alt_key'], 
+                p['cookie'], 
+                ",".join(p['replicas']), 
+                p['status'], 
+                p['created_at']
+            )
+            for p in photo_dump
+        ])
+        
+        conn.commit()
+    logging.info(f"Successfully synchronized and inserted/replaced {len(photo_dump)} photo records.")
+
+
+# --------------------------------------------
+# DEBUG helper
+# --------------------------------------------
+
+def list_all_photos() -> dict:
+    with closing(sqlite3.connect(DB)) as conn:
+        c = conn.cursor()
+        c.execute("SELECT photo_id, logical_volume, alt_key, status FROM photos")
+        rows = c.fetchall()
+
+        return {
+            "total": len(rows),
+            "photos": [
+                {
+                    "photo_id": r[0],
+                    "logical_volume": r[1],
+                    "alt_key": r[2],
+                    "status": r[3]
+                }
+                for r in rows
+            ]
+        }
+================================================================================
+
+FILE PATH: services\directory\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn[standard]
+pydantic
+requests
+httpx
+sqlalchemy
+pika
+================================================================================
+
+FILE PATH: services\discovery\Dockerfile
+--------------------------------------------------------------------------------
+# Use the official Python image as the base image
+FROM python:3.11-slim
+
+# Set the working directory in the container to the project root
+WORKDIR /app
+
+# Install requirements
+COPY services/discovery/requirements.txt requirements_discovery.txt
+RUN pip install --no-cache-dir -r requirements_discovery.txt
+
+# Create the data directory for the shared discovery file
+RUN mkdir -p data
+
+# Copy the entire services structure
+COPY services services/
+
+# Command to run the Discovery service
+CMD ["uvicorn", "services.discovery.main:app", "--host", "0.0.0.0", "--port", "8501"]
+================================================================================
+
+FILE PATH: services\discovery\main.py
+--------------------------------------------------------------------------------
+import os
+import json
+import time
+import sys
+import uvicorn
+import logging
+import operator
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field
+from typing import Dict, List, Optional
+
+# ============================================
+# LOGGING CONFIGURATION (User's Detailed Setup)
+# ============================================
+
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+DISCOVERY_LOG_FILE = os.path.join(LOG_DIR, "discovery.log")
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Remove any existing handlers to avoid duplicates
+for h in root_logger.handlers[:]:
+    root_logger.removeHandler(h)
+
+# File handler
+file_handler = logging.FileHandler(DISCOVERY_LOG_FILE)
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('[DISCOVERY] %(asctime)s - %(levelname)s - %(name)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+root_logger.addHandler(file_handler)
+
+# Console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('[DISCOVERY] %(asctime)s - %(levelname)s - %(name)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+root_logger.addHandler(console_handler)
+
+logger = logging.getLogger(__name__)
+logger.info("=" * 60)
+logger.info("Discovery Service starting")
+logger.info(f"Log file: {DISCOVERY_LOG_FILE}")
+logger.info("=" * 60)
+
+
+# --- Configuration and Persistence ---
+DATA_FILE = os.environ.get("DISCOVERY_FILE", "data/discovery.json")
+TTL_SEC = int(os.environ.get("DISCOVERY_TTL_SEC", 15))  # How long a registration is valid
+
+# --- Pydantic Models ---
+class ServiceRegistration(BaseModel):
+    """Model for a Directory instance registering itself."""
+    url: str
+    mode: str
+    health: str = 'ok'
+
+class ServiceStatus(BaseModel):
+    """The internal model stored in discovery.json."""
+    url: str
+    mode: str
+    last_seen: float
+    health: str
+    service_name: str = Field(None) # Added for deterministic sorting
+
+# --- In-Memory Registry ---
+# registry: {service_name (e.g., 'directory_primary') : ServiceStatus}
+registry: Dict[str, ServiceStatus] = {}
+
+# --- FastAPI Initialization ---
+app = FastAPI(title="Custom Discovery Service")
+
+
+# --------------------------------------------
+# Persistence Helpers
+# --------------------------------------------
+
+def load_registry():
+    """Loads the registry state from the persistent JSON file."""
+    os.makedirs(os.path.dirname(DATA_FILE) or '.', exist_ok=True)
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, 'r') as f:
+                data = json.load(f)
+                global registry
+                
+                # Handling the required 'service_name' for sorting
+                def prepare_status(k, v):
+                    if 'service_name' not in v:
+                        v['service_name'] = k
+                    return ServiceStatus(**v)
+
+                registry = {k: prepare_status(k, v) for k, v in data.items()}
+            logger.info(f"Loaded {len(registry)} entries from {DATA_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to load discovery data: {e}", exc_info=True)
+
+def persist_registry():
+    """Writes the registry state to the persistent JSON file."""
+    try:
+        data = {k: v.model_dump() for k, v in registry.items()}
+        os.makedirs(os.path.dirname(DATA_FILE) or '.', exist_ok=True)
+        with open(DATA_FILE, 'w') as f:
+            json.dump(data, f, indent=2)
+        logger.debug(f"Persisted {len(registry)} registry entries to {DATA_FILE}")
+    except Exception as e:
+        logger.error(f"Failed to persist discovery data: {e}", exc_info=True)
+
+
+# --------------------------------------------
+# Registry Management and Election Logic
+# --------------------------------------------
+
+def prune_and_get_healthy() -> List[ServiceStatus]:
+    """Filters the registry for instances that are healthy and not expired."""
+    current_time = time.time()
+
+    # Prune expired services first
+    expired_keys = [
+        name for name, status in registry.items()
+        if current_time - status.last_seen > TTL_SEC
+    ]
+    for key in expired_keys:
+        logger.warning(f"Pruning expired service: {key} (Last seen: {registry[key].last_seen:.0f})")
+        del registry[key]
+
+    # Return healthy instances
+    healthy = [status for status in registry.values() if status.health == 'ok']
+    logger.debug(f"Healthy instances: {[s.service_name for s in healthy]}")
+    return healthy
+
+def elect_new_leader(healthy_instances: List[ServiceStatus]) -> Optional[ServiceStatus]:
+    """
+    Deterministically elects a new leader based on service name (lexicographical order).
+    The lowest name wins (e.g., directory_primary < directory_replica).
+    """
+    if not healthy_instances:
+        return None
+        
+    # Find the instance with the lowest service_name using operator.attrgetter
+    new_leader = min(healthy_instances, key=operator.attrgetter('service_name'))
+    
+    # Update the record in the registry to reflect the new primary status
+    # This is CRITICAL: it locks the new leader in the DS registry and triggers
+    # the Directory instance's self-promotion on its next heartbeat.
+    registry[new_leader.service_name].mode = 'primary'
+    
+    logger.critical(f"--- LEADER ELECTION --- Declared {new_leader.service_name} as new PRIMARY.")
+    persist_registry()
+    
+    return new_leader
+
+
+def determine_current_leader() -> ServiceStatus | None:
+    """
+    Finds the current primary. If not found, triggers a deterministic election.
+    """
+    
+    healthy_instances = prune_and_get_healthy()
+    
+    # 1. Find the current Primary based on the DS's record
+    current_primary = next((s for s in healthy_instances if s.mode == 'primary'), None)
+    
+    if current_primary:
+        return current_primary
+    
+    # 2. If no Primary is found (it failed/expired), run election
+    return elect_new_leader(healthy_instances)
+
+
+# --------------------------------------------
+# API Endpoints
+# --------------------------------------------
+
+@app.on_event("startup")
+def startup():
+    load_registry()
+    logger.info("Discovery startup complete")
+
+@app.on_event("shutdown")
+def shutdown():
+    persist_registry()
+    logger.info("Discovery shutdown complete")
+
+@app.post("/register/{service_name}")
+def register_service(service_name: str, req: ServiceRegistration):
+    """Endpoint for Directory instances to report their status and role."""
+    
+    current_status = registry.get(service_name)
+    registry_mode = req.mode
+
+    # Preservation Logic: If the registry already declared this instance as Primary,
+    # preserve that mode regardless of the mode sent in the heartbeat request.
+    if current_status and current_status.mode == 'primary':
+        registry_mode = 'primary'
+
+    # Update the internal registry
+    registry[service_name] = ServiceStatus(
+        url=req.url,
+        mode=registry_mode,
+        health=req.health,
+        last_seen=time.time(),
+        service_name=service_name
+    )
+
+    # Note: Persistence is handled within the leader election flow.
+    # We don't persist here to avoid excessive disk I/O on every heartbeat.
+    
+    # Re-run leader determination immediately after registration
+    # This allows for immediate election if the Primary died just before this registration.
+    determine_current_leader()
+
+    logger.info(f"Registered/Updated service: {service_name} (Mode: {registry[service_name].mode}, url={req.url})")
+    return {"status": "registered", "service_name": service_name}
+
+
+@app.get("/leader")
+def get_leader():
+    """
+    Returns the URL of the current Primary Directory instance, triggering an
+    election if necessary.
+    """
+    leader = determine_current_leader()
+
+    if leader:
+        # If the leader found or elected is a replica that was just promoted, 
+        # return its updated primary status to the client.
+        return {"url": leader.url, 
+                "service_name": leader.service_name, 
+                "mode": leader.mode}
+        
+    logger.error("No healthy Directory instances available for leader selection")
+    raise HTTPException(status_code=503, detail="No healthy Directory instances available. Writes halted.")
+
+
+@app.get("/replicas")
+def get_replicas():
+    """Returns a list of URLs for all healthy Directory instances for read load balancing."""
+    healthy_instances = prune_and_get_healthy()
+
+    if not healthy_instances:
+        logger.error("No healthy Directory instances available for reads")
+        raise HTTPException(status_code=503, detail="No healthy Directory instances available for reads.")
+
+    urls = [s.url for s in healthy_instances]
+    logger.debug(f"Replicas returned: {urls}")
+    return {"urls": urls}
+
+
+@app.get("/health")
+def health_check():
+    logger.debug("Health check requested")
+    return {"status": "ok", "entries": len(registry)}
+
+# Add standard Python run block (usually handled by Docker CMD)
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8501"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_config=None)
+================================================================================
+
+FILE PATH: services\discovery\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn[standard]
+pydantic
+httpx
+================================================================================
+
+FILE PATH: services\similarity\Dockerfile
+--------------------------------------------------------------------------------
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 \
+    libsm6 \
+    libxext6 \
+    libxrender1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY services/similarity/requirements.txt requirements_similarity.txt
+
+RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+RUN pip install --no-cache-dir \
+    $(grep -v -e '^torch$' -e '^torchvision$' requirements_similarity.txt)
+
+RUN mkdir -p data
+
+COPY services services/
+
+ENV PORT=8301
+
+CMD ["uvicorn", "services.similarity.main:app", "--host", "0.0.0.0", "--port", "8301"]
+================================================================================
+
+FILE PATH: services\similarity\main.py
+--------------------------------------------------------------------------------
+import os
+import sys
+import faiss
+import numpy as np
+import torch
+from PIL import Image
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
+from torchvision import models
+import uvicorn
+from typing import List
+import logging
+from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
+import json
+import io
+
+# --- Logging Configuration ---
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+SIMILARITY_LOG_FILE = os.path.join(LOG_DIR, "similarity.log")
+
+# Configure root logger
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+
+# Remove any existing handlers to avoid duplicates
+for h in root_logger.handlers[:]:
+    root_logger.removeHandler(h)
+
+# File handler
+file_handler = logging.FileHandler(SIMILARITY_LOG_FILE)
+file_handler.setLevel(logging.INFO)
+file_formatter = logging.Formatter('[SIMILARITY] %(asctime)s - %(levelname)s - %(name)s - %(message)s')
+file_handler.setFormatter(file_formatter)
+root_logger.addHandler(file_handler)
+
+# Console handler
+console_handler = logging.StreamHandler(sys.stdout)
+console_handler.setLevel(logging.INFO)
+console_formatter = logging.Formatter('[SIMILARITY] %(asctime)s - %(levelname)s - %(name)s - %(message)s')
+console_handler.setFormatter(console_formatter)
+root_logger.addHandler(console_handler)
+
+logger = logging.getLogger(__name__)
+logger.info("=" * 60)
+logger.info("Image Similarity Service Starting")
+logger.info(f"Log file: {SIMILARITY_LOG_FILE}")
+logger.info("=" * 60)
+# ...existing code...
+
+# --- FastAPI App Initialization ---
+app = FastAPI(title="Image Similarity Service")
+
+# --- Global Variables & Constants (Updated Paths) ---
+# Base directory is two levels up from services/similarity/main.py
+DATA_BASE_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data') 
+
+# NOTE: UPLOAD_FOLDER is removed, as files are now processed in memory.
+INDEX_FILE = os.path.join(DATA_BASE_DIR, "image_index.faiss")
+MAPPING_FILE = os.path.join(DATA_BASE_DIR, "photo_id_to_embedding_id.json") 
+
+# Ensure the data directory exists
+os.makedirs(DATA_BASE_DIR, exist_ok=True)
+logger.info(f"Data folder '{DATA_BASE_DIR}' is ready. Files will be processed in memory.")
+
+# --- Model Loading ---
+logger.info("Loading pre-trained ResNet50 model...")
+# Load a pre-trained ResNet50 model and remove the final classification layer
+model = models.resnet50(pretrained=True)
+model = torch.nn.Sequential(*(list(model.children())[:-1]))
+model.eval()  # Set the model to evaluation mode
+logger.info("Model loaded successfully.")
+
+# --- Image Preprocessing ---
+preprocess = Compose([
+    Resize(256),
+    CenterCrop(224),
+    ToTensor(),
+    Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+])
+
+# --- Feature Extraction ---
+def get_image_embedding(image_bytes: bytes): # MODIFIED: Accepts bytes instead of path
+    """
+    Generates a vector embedding for a given image (passed as bytes) and L2-normalizes it.
+    """
+    logger.debug(f"Generating embedding from image bytes.")
+    try:
+        # Open image from in-memory stream
+        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+        image_tensor = preprocess(image).unsqueeze(0)
+        with torch.no_grad():
+            embedding = model(image_tensor)
+        embedding_np = embedding.squeeze().numpy()
+        
+        # L2 Normalization (CRUCIAL for Cosine Similarity with IndexFlatIP)
+        norm = np.linalg.norm(embedding_np)
+        if norm > 0:
+            embedding_np = embedding_np / norm
+            
+        logger.debug("Embedding generated and normalized.")
+        return embedding_np.astype('float32')
+    except Exception as e:
+        logger.error(f"Failed to generate embedding: {e}", exc_info=True)
+        raise
+
+# --- FAISS Indexing ---
+embedding_dim = 2048  # ResNet50 output feature dimension
+index = faiss.IndexFlatIP(embedding_dim) 
+
+# --- Image List Management ---
+# image_list is now removed
+photo_id_to_embedding_id = {}
+
+
+# Load existing index and image list if they exist
+if os.path.exists(INDEX_FILE):
+    logger.info(f"Loading existing FAISS index from '{INDEX_FILE}'...")
+    try:
+        index = faiss.read_index(INDEX_FILE)
+        # Removed image_list loading
+        with open(MAPPING_FILE, "r") as f: 
+            photo_id_to_embedding_id = json.load(f)
+        logger.info(f"Loaded {index.ntotal} vectors and {len(photo_id_to_embedding_id)} image mappings. Index type: {type(index).__name__}")
+    except Exception as e:
+        logger.error(f"Failed to load existing index or mapping: {e}. Starting fresh.", exc_info=True)
+        index = faiss.IndexFlatIP(embedding_dim)
+        photo_id_to_embedding_id = {}
+else:
+    logger.info("No existing index found. Starting with a new IndexFlatIP.")
+
+# --- API Endpoints ---
+@app.post("/upload/")
+async def upload_image(file: UploadFile = File(...), photo_id: str = Form(...)):
+    """
+    Upload an image, generate its normalized embedding in-memory, and add it to the FAISS index.
+    """
+    logger.info(f"Received upload request for file: '{file.filename}' with photo_id: '{photo_id}'")
+    
+    # NEW: Read file content directly into memory
+    try:
+        image_bytes = await file.read()
+    except Exception as e:
+        logger.error(f"Failed to read uploaded file: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not read uploaded file content.")
+
+    # Generate and add embedding to index
+    try:
+        embedding = get_image_embedding(image_bytes) # MODIFIED: Pass bytes
+        
+        # FAISS expects a 2D array: (1, embedding_dim)
+        index.add(np.array([embedding]))
+        
+        # Store the photo_id to embedding_id mapping
+        embedding_id = index.ntotal - 1  # FAISS adds to the end, so it's the last index
+        photo_id_to_embedding_id[photo_id] = int(embedding_id)
+        # Removed image_list append
+        logger.info(f"Added new embedding for photo_id '{photo_id}'. Total items in index: {index.ntotal}")
+    except Exception as e:
+        logger.error(f"Failed during embedding or indexing for '{file.filename}' (photo_id: '{photo_id}'): {e}", exc_info=True)
+        # No need to clean up file on disk
+        raise HTTPException(status_code=500, detail="Failed to process image and update index.")
+
+    # Persist the index and photo_id mapping
+    try:
+        faiss.write_index(index, INDEX_FILE)
+        # Removed image_list writing
+        with open(MAPPING_FILE, "w") as f: 
+            json.dump(photo_id_to_embedding_id, f)
+        logger.info(f"Successfully saved index to '{INDEX_FILE}' and photo_id mapping.")
+    except Exception as e:
+        logger.error(f"Failed to persist index or photo_id mapping to disk: {e}", exc_info=True)
+        
+    return {"message": f"Image '{file.filename}' (photo_id: '{photo_id}') uploaded and indexed successfully."}
+
+@app.post("/find_similar/")
+async def find_similar_images(file: UploadFile = File(...), k: int = Form(5)):
+    """
+    Find and return the k most similar images (highest Cosine Similarity) to the uploaded image.
+    """
+    logger.info(f"Received similarity search for '{file.filename}' with k={k}")
+    if index.ntotal == 0:
+        logger.warning("Similarity search requested, but index is empty.")
+        return {"message": "No images have been indexed yet. Please upload images first."}
+
+    # NEW: Read query file content directly into memory
+    try:
+        query_bytes = await file.read()
+    except Exception as e:
+        logger.error(f"Failed to read query file: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not read query file content.")
+        
+    # Generate normalized embedding for the query image
+    try:
+        query_embedding = get_image_embedding(query_bytes) # MODIFIED: Pass bytes
+        logger.info("Generated normalized embedding for query image.")
+    except Exception as e:
+        logger.error(f"Could not generate embedding for query image: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Could not generate embedding for query image.")
+
+    # Search for k + 10 neighbors to filter out potential duplicates/self-matches
+    search_limit = k + 10 
+    logger.info(f"Searching IndexFlatIP for up to {search_limit} nearest neighbors (highest Cosine Similarity)...")
+    
+    similarities, indices = index.search(np.array([query_embedding]), search_limit)
+    logger.info("Search complete.")
+
+    # --- Process and filter results ---
+    result_indices = indices[0].tolist() 
+    result_similarities = similarities[0].tolist() 
+        
+    embedding_id_to_photo_id = {v: k for k, v in photo_id_to_embedding_id.items()}
+    
+    similar_photo_ids = []
+    similar_distances = [] 
+    
+    SIMILARITY_THRESHOLD_FOR_DUPLICATE = 0.999999
+    
+    for faiss_index_id, sim_val in zip(result_indices, result_similarities):
+        # 1. Skip invalid FAISS indices
+        if faiss_index_id == -1:
+            continue
+            
+        # 2. Skip duplicates/self-matches (i.e., any image where the similarity is near 1.0)
+        if sim_val > SIMILARITY_THRESHOLD_FOR_DUPLICATE:
+            continue
+            
+        # 3. Get the corresponding photo_id
+        photo_id = embedding_id_to_photo_id.get(faiss_index_id)
+        
+        if photo_id:
+            similar_photo_ids.append(photo_id)
+            similar_distances.append(float(sim_val))
+            
+        # 4. Stop once we have 'k' unique (non-duplicate) results
+        if len(similar_photo_ids) >= k:
+            break
+
+    logger.info(f"Found {len(similar_photo_ids)} truly similar images (Cosine Similarity used).")
+
+    return {"similar_photo_ids": similar_photo_ids, "distances": similar_distances}
+
+if __name__ == "__main__":
+    logger.info("Starting Image Similarity Service with Uvicorn...")
+    port = int(os.environ.get("PORT", "8301"))
+    uvicorn.run(app, host="0.0.0.0", port=port, log_config=None)
+================================================================================
+
+FILE PATH: services\similarity\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn
+httpx
+pydantic
+faiss-cpu
+torch
+torchvision
+numpy
+Pillow
+python-multipart
+================================================================================
+
+FILE PATH: services\store\Dockerfile
+--------------------------------------------------------------------------------
+# ...existing code...
+FROM python:3.11-slim
+
+WORKDIR /app
+
+COPY services/store/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Provide services package for imports used by uvicorn
+COPY services /app/services
+
+COPY services/store/main.py .
+
+ENV PORT=8101
+
+CMD ["uvicorn", "services.store.main:app", "--host", "0.0.0.0", "--port", "8101"]
+# ...existing code...
+================================================================================
+
+FILE PATH: services\store\main.py
+--------------------------------------------------------------------------------
+import os
+import json
+import hashlib
+import sys
+from fastapi import FastAPI, Header, Request, HTTPException
+from fastapi.responses import Response
+from typing import Dict
+import uvicorn
+import logging
+
+# Logging: write to console and a service-specific logfile under ./logs
+LOG_DIR = os.environ.get("LOG_DIR", "./logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+STORE_LOG_FILE = os.path.join(LOG_DIR, "store.log")
+
+# Configure root logger and remove existing handlers to avoid duplicates
+root_logger = logging.getLogger()
+root_logger.setLevel(logging.INFO)
+for h in root_logger.handlers[:]:
+    root_logger.removeHandler(h)
+
+# File handler
+fh = logging.FileHandler(STORE_LOG_FILE)
+fh.setLevel(logging.INFO)
+fh.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s [STORE]: %(message)s'))
+root_logger.addHandler(fh)
+
+# Console handler
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.INFO)
+ch.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(name)s [STORE]: %(message)s'))
+root_logger.addHandler(ch)
+
+logger = logging.getLogger(__name__)
+logger.info("=" * 60)
+logger.info("Store Service Starting")
+logger.info(f"Log file: {STORE_LOG_FILE}")
+logger.info("=" * 60)
+
+app = FastAPI()
+
+# ---------------------------------------
+# Store Identity and Data Directory
+# ---------------------------------------
+
+STORE_ID = os.environ.get("STORE_ID", "store1")
+DATA_DIR = os.environ.get("DATA_DIR", "./data/store")
+# CRITICAL FIX: Read LV_CAPACITY_BYTES from environment, defaulting to the large value set by Directory
+# If the environment variable is not set, it will now default to 1GB
+LV_CAPACITY_BYTES = int(os.environ.get("LV_CAPACITY_BYTES", 1000000000)) 
+os.makedirs(DATA_DIR, exist_ok=True)
+
+logger.info(f"STORE_ID={STORE_ID}, DATA_DIR={DATA_DIR}")
+logger.info(f"Reported LV Capacity: {LV_CAPACITY_BYTES} bytes")
+
+# index[lv][photo_id] = {offset, size, alt_key, deleted, checksum}
+index: Dict[str, Dict[int, dict]] = {}
+
+# file handles cache
+files = {}
+
+
+# ---------------------------------------
+# Path helpers
+# ---------------------------------------
+
+def index_path_for(lv: str) -> str:
+    return os.path.join(DATA_DIR, f"{lv}.idx.json")
+
+
+def volume_path_for(lv: str) -> str:
+    return os.path.join(DATA_DIR, f"haystack_{lv}.dat")
+
+
+# ---------------------------------------
+# Index load & persist
+# ---------------------------------------
+
+def load_index(lv: str):
+    path = index_path_for(lv)
+    if os.path.exists(path):
+        try:
+            with open(path, "r") as f:
+                index[lv] = {int(k): v for k, v in json.load(f).items()}
+            logger.info(f"Loaded index for {lv} with {len(index[lv])} entries")
+        except Exception as e:
+            logger.error(f"Failed to load index for {lv}: {e}", exc_info=True)
+            index[lv] = {}
+    else:
+        index[lv] = {}
+        logger.info(f"No existing index for {lv}; initialized empty index")
+
+
+def persist_index(lv: str):
+    path = index_path_for(lv)
+    try:
+        with open(path, "w") as f:
+            json.dump({str(k): v for k, v in index.get(lv, {}).items()}, f)
+        logger.debug(f"Persisted index for {lv} ({len(index.get(lv, {}))} entries)")
+    except Exception as e:
+        logger.error(f"Failed to persist index for {lv}: {e}", exc_info=True)
+
+
+# ---------------------------------------
+# Volume file handling
+# ---------------------------------------
+
+def open_volume_file(lv: str):
+    """Ensure an open append-mode file for logical volume lv."""
+    if lv not in files:
+        path = volume_path_for(lv)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fh = open(path, "ab+")
+        files[lv] = fh
+        logger.info(f"Opened volume file for {lv} at {path}")
+    return files[lv]
+
+
+def get_volume_size(lv: str) -> int:
+    """Returns the current size of the data file in bytes, or 0 if it doesn't exist."""
+    path = volume_path_for(lv)
+    try:
+        return os.path.getsize(path)
+    except FileNotFoundError:
+        return 0
+    except Exception as e:
+        logger.error(f"Error getting size for {lv}: {e}", exc_info=True)
+        return 0
+
+
+def rebuild_index_from_volume(lv: str):
+    """
+    Rebuild index by scanning haystack_<lv>.dat.
+
+    Needle format:
+      [4-byte header_len][header_json][data][checksum_hex]
+    """
+    path = volume_path_for(lv)
+    idx = {}
+
+    if not os.path.exists(path):
+        index[lv] = {}
+        logger.info(f"No volume file for {lv}; skipping rebuild")
+        return
+
+    logger.info(f"Rebuilding index for {lv} from volume file {path}")
+    try:
+        with open(path, "rb") as f:
+            offset = 0
+            while True:
+                # ... (rest of rebuild logic remains the same) ...
+                hlen_b = f.read(4)
+                if not hlen_b or len(hlen_b) < 4:
+                    break
+
+                hlen = int.from_bytes(hlen_b, "big")
+                header_raw = f.read(hlen)
+                if not header_raw or len(header_raw) < hlen:
+                    break
+
+                try:
+                    header = json.loads(header_raw.decode("utf-8"))
+                except Exception:
+                    break
+
+                photo_id = int(header["photo_id"])
+                size = header["size"]
+                alt_key = header.get("alt_key", "orig")
+
+                data = f.read(size)
+                checksum_raw = f.read(64)   # 64-byte hex
+                checksum = checksum_raw.decode() if checksum_raw else None
+
+                idx[photo_id] = {
+                    "offset": offset,
+                    "size": size,
+                    "alt_key": alt_key,
+                    "deleted": False,
+                    "checksum": checksum,
+                }
+
+                offset += 4 + hlen + size + (len(checksum_raw) if checksum_raw else 0)
+
+        index[lv] = idx
+        persist_index(lv)
+        logger.info(f"Rebuild complete for {lv}; entries={len(idx)}")
+    except Exception as e:
+        logger.error(f"Error rebuilding index for {lv}: {e}", exc_info=True)
+        index[lv] = {}
+        persist_index(lv)
+
+
+# ---------------------------------------
+# Startup: load default LV (lv-1)
+# ---------------------------------------
+
+@app.on_event("startup")
+def startup():
+    # Load all volumes potentially referenced in the index files
+    # We load lv-1 explicitly to ensure it is in memory
+    default_lv = "lv-1"
+    if default_lv not in index:
+        load_index(default_lv)
+        if not index[default_lv] and get_volume_size(default_lv) > 0:
+            rebuild_index_from_volume(default_lv)
+    logger.info("Store startup complete")
+
+
+# ---------------------------------------
+# STATS (New endpoint for Directory polling)
+# ---------------------------------------
+
+@app.get("/volume/{lv}/stats")
+def get_volume_stats(lv: str):
+    """
+    Reports the current physical usage of the volume. 
+    Used by the Directory Primary for capacity polling.
+    """
+    size = get_volume_size(lv)
+    
+    # NOTE: LV_CAPACITY_BYTES is read from ENV and synchronized with the Directory's view.
+    
+    logger.debug(f"[STATS] lv={lv} reported size={size}")
+    
+    return {
+        "status": "ok",
+        "store_id": STORE_ID,
+        "logical_volume": lv,
+        "used_bytes": size,
+        "total_capacity_bytes": LV_CAPACITY_BYTES
+    }
+
+
+# ---------------------------------------
+# APPEND (write needle)
+# ---------------------------------------
+
+@app.post("/volume/{lv}/append")
+async def append(
+    lv: str,
+    request: Request,
+    x_photo_id: int = Header(None),
+    x_cookie: str = Header(None),
+    x_alt_key: str = Header("orig")
+):
+    logger.info(f"[APPEND] lv={lv} photo_id={x_photo_id} alt_key={x_alt_key}")
+    if x_photo_id is None:
+        logger.warning("[APPEND] Missing X-Photo-ID header")
+        raise HTTPException(status_code=400, detail="Missing X-Photo-ID header")
+
+    data = await request.body()
+    size = len(data)
+
+    # Simple check against max capacity (for safety, though Directory should prevent this)
+    current_size = get_volume_size(lv)
+    if current_size + size > LV_CAPACITY_BYTES:
+         logger.error(f"[APPEND] Volume {lv} exceeded local capacity ({current_size + size} > {LV_CAPACITY_BYTES}). Rejecting.")
+         # Return the appropriate HTTP status code to signal client/directory failure
+         raise HTTPException(status_code=413, detail="Volume capacity exceeded.") 
+
+    header = {
+        "photo_id": int(x_photo_id),
+        "alt_key": x_alt_key,
+        "size": size,
+        "cookie": x_cookie,
+    }
+
+    header_b = json.dumps(header).encode("utf-8")
+    header_len = len(header_b)
+
+    checksum = hashlib.sha256(data).hexdigest()
+
+    fh = open_volume_file(lv)
+    fh.seek(0, os.SEEK_END)
+    offset = fh.tell()
+
+    try:
+        # Write needle frame
+        fh.write(header_len.to_bytes(4, "big"))
+        fh.write(header_b)
+        fh.write(data)
+        fh.write(checksum.encode("utf-8"))
+        fh.flush()
+    except Exception as e:
+        logger.error(f"[APPEND] Failed to write needle for photo {x_photo_id} to {lv}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="failed to write data")
+
+    # Update in-memory index
+    if lv not in index:
+        index[lv] = {}
+
+    index[lv][int(x_photo_id)] = {
+        "offset": offset,
+        "size": size,
+        "alt_key": x_alt_key,
+        "deleted": False,
+        "checksum": checksum,
+    }
+
+    persist_index(lv)
+    logger.info(f"[APPEND] Stored photo_id={x_photo_id} at offset={offset} size={size} checksum={checksum}")
+
+    return {
+        "status": "stored",
+        "lv": lv,
+        "offset": offset,
+        "size": size,
+        "checksum": checksum
+    }
+
+
+# ---------------------------------------
+# READ (retrieve needle)
+# ---------------------------------------
+
+@app.get("/volume/{lv}/read")
+def read(lv: str, photo_id: int = None):
+    logger.info(f"[READ] lv={lv} photo_id={photo_id}")
+    if photo_id is None:
+        logger.warning("[READ] photo_id missing in request")
+        raise HTTPException(status_code=400, detail="photo_id required")
+
+    photo_id = int(photo_id)
+
+    if lv not in index or photo_id not in index[lv]:
+        logger.warning(f"[READ] photo_id={photo_id} not found in lv={lv}")
+        raise HTTPException(status_code=404, detail="not found")
+
+    entry = index[lv][photo_id]
+    if entry["deleted"]:
+        logger.warning(f"[READ] photo_id={photo_id} marked deleted")
+        raise HTTPException(status_code=410, detail="photo deleted")
+
+    offset = entry["offset"]
+    size = entry["size"]
+
+    path = volume_path_for(lv)
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+
+            # Read header len
+            hlen_b = f.read(4)
+            if len(hlen_b) < 4:
+                logger.error("[READ] corrupt volume (header len)")
+                raise HTTPException(status_code=500, detail="corrupt volume")
+
+            hlen = int.from_bytes(hlen_b, "big")
+            header_raw = f.read(hlen)
+            _ = header_raw  # parsed but unused
+            data = f.read(size)
+            checksum_raw = f.read(64)
+            checksum = checksum_raw.decode() if checksum_raw else None
+
+            # Optional checksum verification
+            if checksum and checksum != entry["checksum"]:
+                logger.error(f"[READ] checksum mismatch for photo {photo_id}")
+                raise HTTPException(status_code=500, detail="checksum mismatch")
+
+            logger.info(f"[READ] Serving photo_id={photo_id} size={size}")
+            return Response(content=data, media_type="application/octet-stream")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[READ] Unexpected error while reading photo {photo_id} from {lv}: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="read failed")
+
+
+# ---------------------------------------
+# EXISTS
+# ---------------------------------------
+
+@app.get("/volume/{lv}/exists")
+def exists(lv: str, photo_id: int):
+    logger.debug(f"[EXISTS] lv={lv} photo_id={photo_id}")
+    if lv not in index:
+        return {"exists": False}
+
+    entry = index[lv].get(int(photo_id))
+    if not entry:
+        return {"exists": False}
+
+    return {
+        "exists": True,
+        "offset": entry["offset"],
+        "size": entry["size"],
+        "deleted": entry["deleted"]
+    }
+
+
+# ---------------------------------------
+# DELETE (soft)
+# ---------------------------------------
+
+@app.post("/volume/{lv}/delete")
+def mark_delete(lv: str, payload: dict):
+    photo_id = int(payload.get("photo_id"))
+    logger.info(f"[DELETE] lv={lv} photo_id={photo_id}")
+
+    if lv not in index or photo_id not in index[lv]:
+        logger.warning(f"[DELETE] photo_id={photo_id} not found in lv={lv}")
+        return {"status": "not_found"}
+
+    index[lv][photo_id]["deleted"] = True
+    persist_index(lv)
+
+    # Append delete marker for compaction/audit
+    fh = open_volume_file(lv)
+    fh.seek(0, os.SEEK_END)
+
+    marker = {"delete": photo_id}
+    marker_b = json.dumps(marker).encode("utf-8")
+
+    try:
+        fh.write(len(marker_b).to_bytes(4, "big"))
+        fh.write(marker_b)
+        fh.flush()
+    except Exception as e:
+        logger.error(f"[DELETE] Failed to append delete marker for photo {photo_id}: {e}", exc_info=True)
+
+    logger.info(f"[DELETE] Marked photo_id={photo_id} as deleted")
+    return {"status": "deleted", "photo_id": photo_id}
+
+
+# ---------------------------------------
+# HEALTH
+# ---------------------------------------
+
+@app.get("/health")
+def health():
+    totals = {lv: len(index.get(lv, {})) for lv in index}
+    return {"store_id": STORE_ID, "volumes": totals}
+
+
+if __name__ == "__main__":
+    logger.info("Starting Store Service with Uvicorn")
+    port = int(os.environ.get("PORT", "8101"))
+    uvicorn.run(app, host="0.0.0.0", port=port)
+================================================================================
+
+FILE PATH: services\store\requirements.txt
+--------------------------------------------------------------------------------
+fastapi
+uvicorn[standard]
+pydantic
+python-multipart
+================================================================================
+

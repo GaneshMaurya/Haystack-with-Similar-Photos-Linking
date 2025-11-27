@@ -1,245 +1,193 @@
 import os
-import sys
-import faiss
-import numpy as np
-import torch
-from PIL import Image
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from torchvision import models
-import uvicorn
-from typing import List
-import logging
-from torchvision.transforms import Compose, Resize, CenterCrop, ToTensor, Normalize
 import json
-import io
+import asyncio
+import threading
+import logging
+import pika
+import httpx
+import uvicorn
+import numpy as np
+from fastapi import FastAPI, HTTPException
+# Only import retrieval system if we are MASTER (to save RAM on workers)
+# Only import feature extractor if we are WORKER (to save RAM on master)
 
-# --- Logging Configuration ---
-LOG_DIR = os.environ.get("LOG_DIR", "./logs")
-os.makedirs(LOG_DIR, exist_ok=True)
-SIMILARITY_LOG_FILE = os.path.join(LOG_DIR, "similarity.log")
+# --- Configuration ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("similarity-service")
 
-# Configure root logger
-root_logger = logging.getLogger()
-root_logger.setLevel(logging.INFO)
+MODE = os.environ.get("SERVICE_MODE", "MASTER") # "MASTER" or "WORKER"
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
+API_URL = os.environ.get("API_URL", "http://api:8080")
+DATA_DIR = "/data/similarity_images"
 
-# Remove any existing handlers to avoid duplicates
-for h in root_logger.handlers[:]:
-    root_logger.removeHandler(h)
+# --- Shared RabbitMQ Helpers ---
+def get_channel():
+    params = pika.URLParameters(RABBITMQ_URL)
+    connection = pika.BlockingConnection(params)
+    return connection, connection.channel()
 
-# File handler
-file_handler = logging.FileHandler(SIMILARITY_LOG_FILE)
-file_handler.setLevel(logging.INFO)
-file_formatter = logging.Formatter('[SIMILARITY] %(asctime)s - %(levelname)s - %(name)s - %(message)s')
-file_handler.setFormatter(file_formatter)
-root_logger.addHandler(file_handler)
-
-# Console handler
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setLevel(logging.INFO)
-console_formatter = logging.Formatter('[SIMILARITY] %(asctime)s - %(levelname)s - %(name)s - %(message)s')
-console_handler.setFormatter(console_formatter)
-root_logger.addHandler(console_handler)
-
-logger = logging.getLogger(__name__)
-logger.info("=" * 60)
-logger.info("Image Similarity Service Starting")
-logger.info(f"Log file: {SIMILARITY_LOG_FILE}")
-logger.info("=" * 60)
-# ...existing code...
-
-# --- FastAPI App Initialization ---
-app = FastAPI(title="Image Similarity Service")
-
-# --- Global Variables & Constants (Updated Paths) ---
-# Base directory is two levels up from services/similarity/main.py
-DATA_BASE_DIR = os.path.join(os.path.dirname(__file__), '..', '..', 'data') 
-
-# NOTE: UPLOAD_FOLDER is removed, as files are now processed in memory.
-INDEX_FILE = os.path.join(DATA_BASE_DIR, "image_index.faiss")
-MAPPING_FILE = os.path.join(DATA_BASE_DIR, "photo_id_to_embedding_id.json") 
-
-# Ensure the data directory exists
-os.makedirs(DATA_BASE_DIR, exist_ok=True)
-logger.info(f"Data folder '{DATA_BASE_DIR}' is ready. Files will be processed in memory.")
-
-# --- Model Loading ---
-logger.info("Loading pre-trained ResNet50 model...")
-# Load a pre-trained ResNet50 model and remove the final classification layer
-model = models.resnet50(pretrained=True)
-model = torch.nn.Sequential(*(list(model.children())[:-1]))
-model.eval()  # Set the model to evaluation mode
-logger.info("Model loaded successfully.")
-
-# --- Image Preprocessing ---
-preprocess = Compose([
-    Resize(256),
-    CenterCrop(224),
-    ToTensor(),
-    Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
-
-# --- Feature Extraction ---
-def get_image_embedding(image_bytes: bytes): # MODIFIED: Accepts bytes instead of path
-    """
-    Generates a vector embedding for a given image (passed as bytes) and L2-normalizes it.
-    """
-    logger.debug(f"Generating embedding from image bytes.")
-    try:
-        # Open image from in-memory stream
-        image = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-        image_tensor = preprocess(image).unsqueeze(0)
-        with torch.no_grad():
-            embedding = model(image_tensor)
-        embedding_np = embedding.squeeze().numpy()
-        
-        # L2 Normalization (CRUCIAL for Cosine Similarity with IndexFlatIP)
-        norm = np.linalg.norm(embedding_np)
-        if norm > 0:
-            embedding_np = embedding_np / norm
-            
-        logger.debug("Embedding generated and normalized.")
-        return embedding_np.astype('float32')
-    except Exception as e:
-        logger.error(f"Failed to generate embedding: {e}", exc_info=True)
-        raise
-
-# --- FAISS Indexing ---
-embedding_dim = 2048  # ResNet50 output feature dimension
-index = faiss.IndexFlatIP(embedding_dim) 
-
-# --- Image List Management ---
-# image_list is now removed
-photo_id_to_embedding_id = {}
-
-
-# Load existing index and image list if they exist
-if os.path.exists(INDEX_FILE):
-    logger.info(f"Loading existing FAISS index from '{INDEX_FILE}'...")
-    try:
-        index = faiss.read_index(INDEX_FILE)
-        # Removed image_list loading
-        with open(MAPPING_FILE, "r") as f: 
-            photo_id_to_embedding_id = json.load(f)
-        logger.info(f"Loaded {index.ntotal} vectors and {len(photo_id_to_embedding_id)} image mappings. Index type: {type(index).__name__}")
-    except Exception as e:
-        logger.error(f"Failed to load existing index or mapping: {e}. Starting fresh.", exc_info=True)
-        index = faiss.IndexFlatIP(embedding_dim)
-        photo_id_to_embedding_id = {}
-else:
-    logger.info("No existing index found. Starting with a new IndexFlatIP.")
-
-# --- API Endpoints ---
-@app.post("/upload/")
-async def upload_image(file: UploadFile = File(...), photo_id: str = Form(...)):
-    """
-    Upload an image, generate its normalized embedding in-memory, and add it to the FAISS index.
-    """
-    logger.info(f"Received upload request for file: '{file.filename}' with photo_id: '{photo_id}'")
+# ==============================================================================
+#                                   WORKER MODE
+#          (Listens to photo.uploaded -> Computes Vector -> Sends to Master)
+# ==============================================================================
+if MODE == "WORKER":
+    from feature_extractor import ImageFeatureExtractor
     
-    # NEW: Read file content directly into memory
-    try:
-        image_bytes = await file.read()
-    except Exception as e:
-        logger.error(f"Failed to read uploaded file: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Could not read uploaded file content.")
+    # Initialize AI Model (Heavy CPU usage)
+    logger.info("Initializing AI Model for Worker...")
+    extractor = ImageFeatureExtractor()
+    os.makedirs(DATA_DIR, exist_ok=True)
 
-    # Generate and add embedding to index
-    try:
-        embedding = get_image_embedding(image_bytes) # MODIFIED: Pass bytes
+    def download_image(photo_id):
+        local_path = os.path.join(DATA_DIR, f"{photo_id}.jpg")
+        if os.path.exists(local_path): return local_path
+        try:
+            with httpx.Client() as client:
+                resp = client.get(f"{API_URL}/photo/{photo_id}", timeout=30.0)
+                if resp.status_code == 200:
+                    with open(local_path, "wb") as f: f.write(resp.content)
+                    return local_path
+        except Exception as e:
+            logger.error(f"Download failed: {e}")
+        return None
+
+    def worker_callback(ch, method, properties, body):
+        try:
+            event = json.loads(body)
+            if event.get("event") == "photo.uploaded":
+                photo_id = event.get("photo_id")
+                logger.info(f"[Worker] Processing Photo {photo_id}...")
+                
+                # 1. Download
+                path = download_image(photo_id)
+                if path:
+                    # 2. Compute Vector (Heavy Operation)
+                    vector = extractor.extract_features(path)
+                    
+                    # 3. Send Vector to Master
+                    payload = {
+                        "event": "vector.ready",
+                        "photo_id": photo_id,
+                        "path": path,
+                        "vector": vector.tolist() # Convert numpy to list for JSON
+                    }
+                    
+                    # Publish to 'vector_queue'
+                    ch.basic_publish(
+                        exchange='',
+                        routing_key='vector_queue',
+                        body=json.dumps(payload),
+                        properties=pika.BasicProperties(delivery_mode=2)
+                    )
+                    logger.info(f"[Worker] Vector sent for {photo_id}")
+
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+        except Exception as e:
+            logger.error(f"[Worker] Error: {e}")
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+    def start_worker():
+        conn, ch = get_channel()
+        ch.exchange_declare(exchange='photo.events', exchange_type='topic', durable=True)
+        q = ch.queue_declare(queue='similarity_worker_queue', durable=True).method.queue
+        ch.queue_bind(exchange='photo.events', queue=q, routing_key='photo.uploaded')
+        # Also declare the destination queue so it exists
+        ch.queue_declare(queue='vector_queue', durable=True)
         
-        # FAISS expects a 2D array: (1, embedding_dim)
-        index.add(np.array([embedding]))
-        
-        # Store the photo_id to embedding_id mapping
-        embedding_id = index.ntotal - 1  # FAISS adds to the end, so it's the last index
-        photo_id_to_embedding_id[photo_id] = int(embedding_id)
-        # Removed image_list append
-        logger.info(f"Added new embedding for photo_id '{photo_id}'. Total items in index: {index.ntotal}")
-    except Exception as e:
-        logger.error(f"Failed during embedding or indexing for '{file.filename}' (photo_id: '{photo_id}'): {e}", exc_info=True)
-        # No need to clean up file on disk
-        raise HTTPException(status_code=500, detail="Failed to process image and update index.")
+        logger.info("[Worker] Ready to process photos...")
+        ch.basic_consume(queue=q, on_message_callback=worker_callback)
+        ch.start_consuming()
 
-    # Persist the index and photo_id mapping
-    try:
-        faiss.write_index(index, INDEX_FILE)
-        # Removed image_list writing
-        with open(MAPPING_FILE, "w") as f: 
-            json.dump(photo_id_to_embedding_id, f)
-        logger.info(f"Successfully saved index to '{INDEX_FILE}' and photo_id mapping.")
-    except Exception as e:
-        logger.error(f"Failed to persist index or photo_id mapping to disk: {e}", exc_info=True)
-        
-    return {"message": f"Image '{file.filename}' (photo_id: '{photo_id}') uploaded and indexed successfully."}
+    if __name__ == "__main__":
+        start_worker()
 
-@app.post("/find_similar/")
-async def find_similar_images(file: UploadFile = File(...), k: int = Form(5)):
-    """
-    Find and return the k most similar images (highest Cosine Similarity) to the uploaded image.
-    """
-    logger.info(f"Received similarity search for '{file.filename}' with k={k}")
-    if index.ntotal == 0:
-        logger.warning("Similarity search requested, but index is empty.")
-        return {"message": "No images have been indexed yet. Please upload images first."}
 
-    # NEW: Read query file content directly into memory
-    try:
-        query_bytes = await file.read()
-    except Exception as e:
-        logger.error(f"Failed to read query file: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Could not read query file content.")
-        
-    # Generate normalized embedding for the query image
-    try:
-        query_embedding = get_image_embedding(query_bytes) # MODIFIED: Pass bytes
-        logger.info("Generated normalized embedding for query image.")
-    except Exception as e:
-        logger.error(f"Could not generate embedding for query image: {e}", exc_info=True)
-        raise HTTPException(status_code=500, detail="Could not generate embedding for query image.")
-
-    # Search for k + 10 neighbors to filter out potential duplicates/self-matches
-    search_limit = k + 10 
-    logger.info(f"Searching IndexFlatIP for up to {search_limit} nearest neighbors (highest Cosine Similarity)...")
+# ==============================================================================
+#                                   MASTER MODE
+#          (Listens to vector.ready -> Writes to FAISS -> Serves Search API)
+# ==============================================================================
+elif MODE == "MASTER":
+    from retrieval_system import ImageRetrievalSystem
     
-    similarities, indices = index.search(np.array([query_embedding]), search_limit)
-    logger.info("Search complete.")
+    INDEX_PATH = "/data/faiss.index"
+    META_PATH = "/data/faiss_meta.json"
+    
+    # Initialize Database (Heavy RAM usage)
+    logger.info("Initializing FAISS Master...")
+    similarity_system = ImageRetrievalSystem(index_path=INDEX_PATH, metadata_path=META_PATH, use_gpu=False)
+    
+    app = FastAPI()
 
-    # --- Process and filter results ---
-    result_indices = indices[0].tolist() 
-    result_similarities = similarities[0].tolist() 
+    # --- Batch Processor for Vectors ---
+    def master_callback(ch, method, properties, body):
+        try:
+            event = json.loads(body)
+            if event.get("event") == "vector.ready":
+                photo_id = event["photo_id"]
+                vector = np.array(event["vector"], dtype=np.float32)
+                path = event["path"]
+                
+                # Write to FAISS (This is fast now because vector is already computed)
+                # We need to manually add vector because add_single_image expects a file path to re-compute
+                # Let's modify usage of retrieval system slightly or use internal index directly
+                
+                # Direct Index Injection
+                similarity_system.index.add(np.array([vector]))
+                new_id = similarity_system.index.ntotal - 1
+                similarity_system.metadata[str(new_id)] = {
+                    'photo_id': str(photo_id),
+                    'path': path,
+                    'timestamp': "now"
+                }
+                similarity_system.save(INDEX_PATH, META_PATH)
+                logger.info(f"[Master] Indexed Photo {photo_id}")
+
+            ch.basic_ack(delivery_tag=method.delivery_tag)
+        except Exception as e:
+            logger.error(f"[Master] Error: {e}")
+            ch.basic_nack(delivery_tag=method.delivery_tag, requeue=False)
+
+    def start_master_consumer():
+        conn, ch = get_channel()
+        ch.queue_declare(queue='vector_queue', durable=True)
+        logger.info("[Master] Listening for vectors...")
+        ch.basic_consume(queue='vector_queue', on_message_callback=master_callback)
+        ch.start_consuming()
+
+    # Start consumer thread
+    threading.Thread(target=start_master_consumer, daemon=True).start()
+
+    @app.get("/similar/{photo_id}")
+    def get_similar_photos(photo_id: str, k: int = 5):
+        # Master keeps the 'find_path_by_id' logic, but needs to re-implement search 
+        # because 'similarity_system.search' expects a file path to re-compute embedding.
+        # Ideally, we should fetch embedding from DB, but FAISS IndexFlatL2 doesn't store IDs easily.
+        # For this demo, we will use the logic: Get Path -> Re-compute? 
+        # NO, Master shouldn't compute.
+        # Strategy: Master will do a cheap re-compute or we store vectors in metadata (heavy).
+        # Fallback: Master DOES compute only for query (low load), Workers do compute for indexing (high load).
         
-    embedding_id_to_photo_id = {v: k for k, v in photo_id_to_embedding_id.items()}
-    
-    similar_photo_ids = []
-    similar_distances = [] 
-    
-    SIMILARITY_THRESHOLD_FOR_DUPLICATE = 0.999999
-    
-    for faiss_index_id, sim_val in zip(result_indices, result_similarities):
-        # 1. Skip invalid FAISS indices
-        if faiss_index_id == -1:
-            continue
-            
-        # 2. Skip duplicates/self-matches (i.e., any image where the similarity is near 1.0)
-        if sim_val > SIMILARITY_THRESHOLD_FOR_DUPLICATE:
-            continue
-            
-        # 3. Get the corresponding photo_id
-        photo_id = embedding_id_to_photo_id.get(faiss_index_id)
+        path = similarity_system.find_path_by_id(photo_id)
+        if not path: raise HTTPException(404, "Not found")
         
-        if photo_id:
-            similar_photo_ids.append(photo_id)
-            similar_distances.append(float(sim_val))
-            
-        # 4. Stop once we have 'k' unique (non-duplicate) results
-        if len(similar_photo_ids) >= k:
-            break
+        # Note: Master still needs feature_extractor for SEARCH queries.
+        # To fix this properly, we lazily load extractor only on Master when searching.
+        if not hasattr(app, "extractor"):
+             from feature_extractor import ImageFeatureExtractor
+             app.extractor = ImageFeatureExtractor()
+        
+        query_feat = app.extractor.extract_features(path)
+        distances, indices = similarity_system.index.search(query_feat.reshape(1, -1), k)
+        
+        results = []
+        for dist, idx in zip(distances[0], indices[0]):
+            s_idx = str(int(idx))
+            if s_idx in similarity_system.metadata:
+                item = similarity_system.metadata[s_idx]
+                if str(item['photo_id']) != str(photo_id):
+                    results.append({"photo_id": item['photo_id'], "distance": float(dist)})
+        
+        return {"photo_id": photo_id, "similar": results}
 
-    logger.info(f"Found {len(similar_photo_ids)} truly similar images (Cosine Similarity used).")
-
-    return {"similar_photo_ids": similar_photo_ids, "distances": similar_distances}
-
-if __name__ == "__main__":
-    logger.info("Starting Image Similarity Service with Uvicorn...")
-    port = int(os.environ.get("PORT", "8301"))
-    uvicorn.run(app, host="0.0.0.0", port=port, log_config=None)
+    if __name__ == "__main__":
+        uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,35 +1,31 @@
 version: "3.8"
 
-# Define a shared network for service communication
 networks:
   haystack-net:
     driver: bridge
 
-# Define volumes for persistent data (FAISS index, SQLite DB, Store data, Cache data)
 volumes:
   data-volume:
     driver: local
-  rabbitmq-data: # Uncomment this volume when activating RabbitMQ
+  rabbitmq-data:
     driver: local
 
 services:
-  # ----------------------------------------------------
-  # 1. API Gateway (Entry Point)
-  # ----------------------------------------------------
+  # --- 1. API Gateway ---
   api:
     build:
       context: .
       dockerfile: services/api/Dockerfile
     image: haystack-api:latest
     ports:
-      - "8000:8000" # Expose the API Gateway port
+      - "8000:8000"
     environment:
-      # DIRECTORY access is now through the Discovery Service (DS)
       DISCOVERY_SERVICE_URL: http://discovery:8501
       CACHE_URL: http://cache:8201
-      SIMILARITY_URL: http://similarity:8301
-      USE_RABBITMQ: "0" # Currently disabled. Set to "1" when activating RabbitMQ.
-      # Store mapping uses internal service names/ports (no localhost)
+      # Point to Similarity Master on internal port 8000
+      SIMILARITY_URL: http://similarity:8000
+      USE_RABBITMQ: "1"
+      RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
       STORE_PORTS: "store1=store1:8101,store2=store2:8101,store3=store3:8101"
     networks:
       - haystack-net
@@ -42,48 +38,26 @@ services:
       - store3
       - cache
       - similarity
-      - rabbitmq # Uncomment this when activating RabbitMQ
-    # CMD using the fully qualified path
-    command:
-      [
-        "uvicorn",
-        "services.api.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8000",
-      ]
+      - rabbitmq
+    command: ["uvicorn", "services.api.main:app", "--host", "0.0.0.0", "--port", "8000"]
 
-  # ----------------------------------------------------
-  # 2. Service Discovery (New Central Registry)
-  # ----------------------------------------------------
+  # --- 2. Service Discovery ---
   discovery:
     build:
       context: .
       dockerfile: services/discovery/Dockerfile
     image: haystack-discovery:latest
     environment:
-      # Data file for persistence (inside shared volume)
       DISCOVERY_FILE: data/discovery.json
     ports:
-      - "8501:8501" # Host port for testing discovery directly
+      - "8501:8501"
     networks:
       - haystack-net
     volumes:
       - data-volume:/app/data
-    command:
-      [
-        "uvicorn",
-        "services.discovery.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8501",
-      ]
+    command: ["uvicorn", "services.discovery.main:app", "--host", "0.0.0.0", "--port", "8501"]
 
-  # ----------------------------------------------------
-  # 3. Directory Services (Primary & Replica)
-  # ----------------------------------------------------
+  # --- 3. Directory Services ---
   directory_primary:
     build:
       context: .
@@ -93,10 +67,8 @@ services:
       DIRECTORY_MODE: primary
       DISCOVERY_SERVICE_URL: http://discovery:8501
       DB_PATH: data/directory.db
-      # Directory knows what stores are available for allocation
       AVAILABLE_STORES: "store1,store2,store3"
       HOSTNAME: directory_primary
-      # *** INCREASED CAPACITY TO 1 GB TO BYPASS ROLLOVER CRASH ***
       LV_CAPACITY_BYTES: 1000000000
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
     ports:
@@ -108,15 +80,7 @@ services:
     depends_on:
       - discovery
       - rabbitmq
-    command:
-      [
-        "uvicorn",
-        "services.directory.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8001",
-      ]
+    command: ["uvicorn", "services.directory.main:app", "--host", "0.0.0.0", "--port", "8001"]
 
   directory_replica:
     build:
@@ -129,7 +93,6 @@ services:
       DB_PATH: data/directory.db
       AVAILABLE_STORES: "store1,store2,store3"
       HOSTNAME: directory_replica
-      # Set capacity to 1 GB
       LV_CAPACITY_BYTES: 1000000000
       RABBITMQ_URL: "amqp://guest:guest@rabbitmq:5672/"
     networks:
@@ -139,19 +102,9 @@ services:
     depends_on:
       - discovery
       - rabbitmq
-    command:
-      [
-        "uvicorn",
-        "services.directory.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8001",
-      ]
+    command: ["uvicorn", "services.directory.main:app", "--host", "0.0.0.0", "--port", "8001"]
 
-  # ----------------------------------------------------
-  # 4. Store Services (Three Instances for 3-way replication)
-  # ----------------------------------------------------
+  # --- 4. Store Services ---
   store1:
     build:
       context: .
@@ -166,15 +119,7 @@ services:
       - haystack-net
     volumes:
       - data-volume:/app/data/store1_data
-    command:
-      [
-        "uvicorn",
-        "services.store.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8101",
-      ]
+    command: ["uvicorn", "services.store.main:app", "--host", "0.0.0.0", "--port", "8101"]
 
   store2:
     build:
@@ -185,20 +130,12 @@ services:
       STORE_ID: store2
       DATA_DIR: /app/data/store2_data
     ports:
-      - "8102:8101" # Host 8102 -> Container 8101
+      - "8102:8101"
     networks:
       - haystack-net
     volumes:
       - data-volume:/app/data/store2_data
-    command:
-      [
-        "uvicorn",
-        "services.store.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8101",
-      ]
+    command: ["uvicorn", "services.store.main:app", "--host", "0.0.0.0", "--port", "8101"]
 
   store3:
     build:
@@ -209,50 +146,63 @@ services:
       STORE_ID: store3
       DATA_DIR: /app/data/store3_data
     ports:
-      - "8103:8101" # Host 8103 -> Container 8101
+      - "8103:8101"
     networks:
       - haystack-net
     volumes:
       - data-volume:/app/data/store3_data
-    command:
-      [
-        "uvicorn",
-        "services.store.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8101",
-      ]
+    command: ["uvicorn", "services.store.main:app", "--host", "0.0.0.0", "--port", "8101"]
 
-  # ----------------------------------------------------
-  # 5. Similarity Service (CPU Only)
-  # ----------------------------------------------------
+  # --- 5. Scalable Similarity Services ---
+  
+  # MASTER: Serves search requests
   similarity:
     build:
       context: .
       dockerfile: services/similarity/Dockerfile
-    image: haystack-similarity:latest
+    image: haystack-similarity-master:latest
     ports:
-      - "8301:8301"
+      - "8301:8000"
     environment:
-      DATA_BASE_DIR: /app/data
+      - SERVICE_MODE=MASTER
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - KMP_DUPLICATE_LIB_OK=TRUE
+      - OMP_NUM_THREADS=1
+      # DATA_DIR must match the volume mapping below
+      - DATA_DIR=/data
     networks:
       - haystack-net
     volumes:
-      - data-volume:/app/data
-    command:
-      [
-        "uvicorn",
-        "services.similarity.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8301",
-      ]
+      # CRITICAL FIX: Map to /data so both services see the same files
+      - data-volume:/data
+    depends_on:
+      - rabbitmq
 
-  # ----------------------------------------------------
-  # 6. Cache Service
-  # ----------------------------------------------------
+  # WORKER: Processes uploads from RabbitMQ
+  similarity-worker:
+    build:
+      context: .
+      dockerfile: services/similarity/Dockerfile
+    image: haystack-similarity-worker:latest
+    environment:
+      - SERVICE_MODE=WORKER
+      - RABBITMQ_URL=amqp://guest:guest@rabbitmq:5672/
+      - API_URL=http://api:8000
+      - KMP_DUPLICATE_LIB_OK=TRUE
+      - OMP_NUM_THREADS=1
+      - DATA_DIR=/data
+    deploy:
+      replicas: 2
+    networks:
+      - haystack-net
+    volumes:
+      # CRITICAL FIX: Map to /data
+      - data-volume:/data
+    depends_on:
+      - rabbitmq
+      - api
+
+  # --- 6. Cache Service ---
   cache:
     build:
       context: .
@@ -267,24 +217,14 @@ services:
       - haystack-net
     volumes:
       - data-volume:/app/data
-    command:
-      [
-        "uvicorn",
-        "services.cache.main:app",
-        "--host",
-        "0.0.0.0",
-        "--port",
-        "8201",
-      ]
+    command: ["uvicorn", "services.cache.main:app", "--host", "0.0.0.0", "--port", "8201"]
 
-  # ----------------------------------------------------
-  # 7. RabbitMQ Service (Asynchronous Messaging)
-  # ----------------------------------------------------
+  # --- 7. RabbitMQ Service ---
   rabbitmq:
     image: rabbitmq:3-management
     ports:
-      - "5673:5672" # Standard AMQP port
-      - "15673:15672" # Management interface
+      - "5672:5672"
+      - "15672:15672"
     volumes:
       - rabbitmq-data:/var/lib/rabbitmq
     networks:

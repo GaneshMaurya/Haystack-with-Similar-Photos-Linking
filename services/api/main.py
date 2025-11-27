@@ -1,7 +1,7 @@
 """
 Haystack-style API Gateway (client-facing). Implements:
-- POST /upload  -> Discovery Lookup (Leader) -> allocate -> append to ALL stores -> commit
-- POST /find_similar -> Query Similarity Service
+- POST /upload  -> Discovery Lookup (Leader) -> allocate -> append to ALL stores -> commit -> RabbitMQ Event
+- GET /find_similar/{photo_id} -> Query Similarity Master (Branch Logic)
 - GET  /photo/{photo_id} -> Directory (Load-Balanced Read) -> Cache lookup -> Read from ANY replica
 - DELETE /photo/{photo_id} -> Discovery Lookup (Leader) -> Directory delete -> delete from ALL replicas -> delete from cache
 """
@@ -50,7 +50,7 @@ root_logger.addHandler(console_handler)
 logger = logging.getLogger(__name__)
 
 logger.info("=" * 60)
-logger.info("API Gateway Starting")
+logger.info("API Gateway Starting (With Branch Similarity Integration)")
 logger.info(f"Log file: {API_LOG_FILE}")
 logger.info("=" * 60)
 
@@ -168,6 +168,7 @@ def publish_event(payload: dict):
     logger.info(f"Publishing event: {payload.get('event', 'unknown')}")
     
     if not USE_RABBITMQ:
+        logger.warning("USE_RABBITMQ is False. Event only logged to file (Worker will NOT pick this up).")
         try:
             os.makedirs("./data", exist_ok=True)
             with open("./data/events.log", "a") as f:
@@ -201,7 +202,7 @@ def publish_event(payload: dict):
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
     """
-    Upload a photo: allocate -> append to all stores -> commit -> similarity indexing
+    Upload a photo: allocate -> append to all stores -> commit -> Trigger Worker via RabbitMQ
     """
     logger.info(f"[UPLOAD] Starting upload for file: {file.filename}")
     
@@ -289,29 +290,9 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
 
         logger.info(f"[UPLOAD] Step 4 Complete: Write committed successfully")
 
-        # 5) Upload to Similarity Service
-        logger.info(f"[UPLOAD] Step 5: Submitting to similarity service")
-        try:
-            async with httpx.AsyncClient() as client:
-                form_data = {'photo_id': str(photo_id)}
-                file_data = {'file': (file.filename, data, file.content_type)}
-                
-                r_sim = await client.post(
-                    f"{SIMILARITY_URL}/upload/",
-                    data=form_data,
-                    files=file_data,
-                    timeout=30.0
-                )
-                
-                if r_sim.status_code == 200:
-                    logger.info(f"[UPLOAD] Step 5 Complete: Photo {photo_id} submitted to similarity service")
-                else:
-                    logger.warning(f"[UPLOAD] Similarity service returned {r_sim.status_code}: {r_sim.text}")
-        except Exception as e:
-            logger.error(f"[UPLOAD] Failed to submit to similarity service: {e}")
-
-        # 6) Publish event
-        logger.info(f"[UPLOAD] Step 6: Publishing event")
+        # 5) Publish event for Similarity Worker (ASYNC)
+        # Note: We removed the synchronous HTTP call to similarity service that was here in the old Main code.
+        logger.info(f"[UPLOAD] Step 5: Publishing event for Async Processing")
         publish_event({
             "event": "photo.uploaded",
             "photo_id": photo_id,
@@ -402,7 +383,7 @@ async def serve_photo(photo_id: int):
                                 content=resp.content,
                                 timeout=5.0
                             )
-                            logger.debug(f"[READ] Cached photo {photo_id}")
+                        logger.debug(f"[READ] Cached photo {photo_id}")
                     except Exception as e:
                         logger.warning(f"[READ] Failed to cache photo {photo_id}: {e}")
 
@@ -510,47 +491,37 @@ async def delete_photo(photo_id: int):
 
 
 # ============================================
-# SIMILARITY SEARCH ENDPOINT
+# SIMILARITY SEARCH ENDPOINT (UPDATED FOR BRANCH)
 # ============================================
 
-@app.post("/find_similar")
-async def find_similar(file: UploadFile = File(...), k: int = Form(5)):
+@app.get("/find_similar/{photo_id}")
+async def find_similar(photo_id: str, k: int = 5):
     """
-    Find similar photos: forward to similarity service
+    Find similar photos using the Branch Similarity Master.
+    NOTE: Branch code searches by existing Photo ID, not by uploading a new file.
     """
-    logger.info(f"[FIND_SIMILAR] Starting search for {file.filename} with k={k}")
+    logger.info(f"[FIND_SIMILAR] Searching for similar photos to ID: {photo_id}")
     
     try:
-        # 1. Read file content
-        logger.info(f"[FIND_SIMILAR] Step 1: Reading query file")
-        try:
-            content = await file.read()
-            logger.info(f"[FIND_SIMILAR] Step 1 Complete: Read {len(content)} bytes")
-        except Exception as e:
-            logger.error(f"[FIND_SIMILAR] Failed to read file: {e}")
-            raise HTTPException(status_code=500, detail="Failed to read query file content.")
-        
-        # 2. Send to similarity service
-        logger.info(f"[FIND_SIMILAR] Step 2: Forwarding to similarity service")
         async with httpx.AsyncClient() as client:
-            form_data = {'k': str(k)}
-            files = {'file': (file.filename, content, file.content_type)}
+            # We call the similarity master (mapped to 'similarity' hostname in docker-compose)
+            # The Branch Master endpoint is GET /similar/{photo_id}
+            sim_url = f"{SIMILARITY_URL}/similar/{photo_id}"
             
-            r_sim = await client.post(
-                f"{SIMILARITY_URL}/find_similar/",
-                data=form_data,
-                files=files,
-                timeout=60.0
-            )
+            logger.info(f"[FIND_SIMILAR] Forwarding to {sim_url} with k={k}")
+            resp = await client.get(sim_url, params={"k": k}, timeout=60.0)
             
-            if r_sim.status_code == 200:
-                logger.info(f"[FIND_SIMILAR] SUCCESS: Received results from similarity service")
-                return r_sim.json()
+            if resp.status_code == 200:
+                logger.info("[FIND_SIMILAR] Success")
+                return resp.json()
+            elif resp.status_code == 404:
+                logger.warning("[FIND_SIMILAR] Photo ID not found in index")
+                raise HTTPException(status_code=404, detail="Photo ID not found in similarity index")
             else:
-                logger.error(f"[FIND_SIMILAR] Similarity service error: {r_sim.status_code} - {r_sim.text}")
+                logger.error(f"[FIND_SIMILAR] Service error: {resp.status_code} - {resp.text}")
                 raise HTTPException(
                     status_code=502,
-                    detail=f"Similarity Service Error: {r_sim.status_code}"
+                    detail=f"Similarity Service Error: {resp.status_code}"
                 )
 
     except httpx.RequestError as e:

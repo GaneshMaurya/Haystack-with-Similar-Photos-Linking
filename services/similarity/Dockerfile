@@ -1,25 +1,25 @@
-FROM python:3.11-slim
+FROM python:3.9-slim
 
 WORKDIR /app
 
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Install system dependencies for imaging
+RUN apt-get update && apt-get install -y \
+    libgl1 \
     libglib2.0-0 \
-    libsm6 \
-    libxext6 \
-    libxrender1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY services/similarity/requirements.txt requirements_similarity.txt
+# Copy requirements from service folder
+COPY services/similarity/requirements.txt .
 
-RUN pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+# Install dependencies (CPU version of torch)
+RUN pip install --no-cache-dir -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cpu
 
-RUN pip install --no-cache-dir \
-    $(grep -v -e '^torch$' -e '^torchvision$' requirements_similarity.txt)
+# Copy the service code into /app
+COPY services/similarity/ .
 
-RUN mkdir -p data
+# Create directory for images and index
+RUN mkdir -p /data/similarity_images
 
-COPY services services/
+EXPOSE 8000
 
-ENV PORT=8301
-
-CMD ["uvicorn", "services.similarity.main:app", "--host", "0.0.0.0", "--port", "8301"]
+CMD ["python", "main.py"]
