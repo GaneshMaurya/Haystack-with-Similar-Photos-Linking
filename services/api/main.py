@@ -1,7 +1,7 @@
 """
 Haystack-style API Gateway (client-facing). Implements:
-- POST /upload  -> Discovery Lookup (Leader) -> allocate -> append to ALL stores -> commit
-- POST /find_similar -> Query Similarity Service
+- POST /upload  -> Discovery Lookup (Leader) -> allocate -> append to ALL stores -> commit -> Publish event for async indexing
+- POST /find_similar -> Query Similarity Service (Master)
 - GET  /photo/{photo_id} -> Directory (Load-Balanced Read) -> Cache lookup -> Read from ANY replica
 - DELETE /photo/{photo_id} -> Discovery Lookup (Leader) -> Directory delete -> delete from ALL replicas -> delete from cache
 """
@@ -67,9 +67,11 @@ app = FastAPI(title="API Gateway")
 DISCOVERY_SERVICE_URL = os.environ.get("DISCOVERY_SERVICE_URL", "http://discovery:8501")
 DIRECTORY_URL = os.environ.get("DIRECTORY_URL", "http://localhost:8080")
 CACHE_URL = os.environ.get("CACHE_URL", "http://cache:8201")
-SIMILARITY_URL = os.environ.get("SIMILARITY_URL", "http://similarity:8301")
-RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@localhost:5672/")
-USE_RABBITMQ = os.environ.get("USE_RABBITMQ", "0") == "1"
+# MODIFIED: Point to the new similarity master service
+SIMILARITY_URL = os.environ.get("SIMILARITY_URL", "http://similarity-master:8000")
+RABBITMQ_URL = os.environ.get("RABBITMQ_URL", "amqp://guest:guest@rabbitmq:5672/")
+# NEW: USE_RABBITMQ is now critical for the new architecture. Default to '1' (enabled).
+USE_RABBITMQ = os.environ.get("USE_RABBITMQ", "1") == "1"
 
 logger.info(f"DISCOVERY_SERVICE_URL: {DISCOVERY_SERVICE_URL}")
 logger.info(f"DIRECTORY_URL: {DIRECTORY_URL}")
@@ -97,9 +99,9 @@ def make_store_url(store_id: str) -> str:
     Handles both Docker network addresses (storeX:port) and local ports.
     """
     logger.debug(f"Resolving store URL for store_id: {store_id}")
-    
+
     port_or_address = _STORE_MAP.get(store_id)
-    
+
     if port_or_address:
         if ':' in port_or_address:
             url = f"http://{port_or_address}"
@@ -109,7 +111,7 @@ def make_store_url(store_id: str) -> str:
             url = f"http://localhost:{port_or_address}"
             logger.debug(f"Store {store_id} -> {url} (local port)")
             return url
-    
+
     logger.warning(f"Store {store_id} not in map, using default fallback")
     return "http://localhost:8101"
 
@@ -117,11 +119,11 @@ def make_store_url(store_id: str) -> str:
 async def _get_directory_leader_url() -> str:
     """Queries the Discovery Service to find the current Directory Primary."""
     logger.info("Querying Discovery Service for Directory leader...")
-    
+
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(f"{DISCOVERY_SERVICE_URL}/leader", timeout=5.0)
-            
+
             if r.status_code == 200:
                 data = r.json()
                 leader_url = data["url"]
@@ -141,17 +143,17 @@ async def _get_directory_leader_url() -> str:
 async def _get_directory_read_url() -> str:
     """Queries the Discovery Service for a list of healthy replicas and returns one randomly."""
     logger.info("Querying Discovery Service for Directory read replica...")
-    
+
     try:
         async with httpx.AsyncClient() as client:
             r = await client.get(f"{DISCOVERY_SERVICE_URL}/replicas", timeout=5.0)
-            
+
             if r.status_code == 200:
                 urls = r.json().get("urls", [])
                 if not urls:
                     logger.error("No healthy Directory instances for reading")
                     raise HTTPException(status_code=503, detail="No healthy Directory instances for reading.")
-                
+
                 selected_url = random.choice(urls)
                 logger.info(f"Directory read replica selected: {selected_url}")
                 return selected_url
@@ -164,34 +166,39 @@ async def _get_directory_read_url() -> str:
 
 
 def publish_event(payload: dict):
-    """Publish event to RabbitMQ or local file."""
-    logger.info(f"Publishing event: {payload.get('event', 'unknown')}")
-    
+    """Publish event to RabbitMQ for workers or log to file as a fallback."""
+    event_name = payload.get('event', 'unknown')
+    logger.info(f"Publishing event: {event_name}")
+
     if not USE_RABBITMQ:
         try:
             os.makedirs("./data", exist_ok=True)
             with open("./data/events.log", "a") as f:
                 f.write(json.dumps(payload) + "\n")
-            logger.info(f"Event logged to ./data/events.log")
+            logger.warning(f"RabbitMQ is disabled. Event '{event_name}' logged to ./data/events.log")
         except Exception as e:
-            logger.error(f"Failed to write event to file: {e}")
+            logger.error(f"Failed to write event to fallback file: {e}")
         return
-    
+
     try:
         params = pika.URLParameters(RABBITMQ_URL)
         conn = pika.BlockingConnection(params)
         ch = conn.channel()
-        ch.exchange_declare(exchange='photo.events', exchange_type='topic', durable=True)
+        ch.exchange_declare(exchange='photo_events', exchange_type='topic', durable=True)
+
+        # The routing key allows consumers to subscribe to specific events
+        routing_key = f"photo.uploaded.{payload.get('photo_id')}"
+
         ch.basic_publish(
-            exchange='photo.events',
-            routing_key='photo.uploaded',
+            exchange='photo_events',
+            routing_key=routing_key,
             body=json.dumps(payload),
-            properties=pika.BasicProperties(delivery_mode=2)
+            properties=pika.BasicProperties(delivery_mode=pika.spec.PERSISTENT_DELIVERY_MODE)
         )
         conn.close()
-        logger.info(f"Event published to RabbitMQ successfully")
+        logger.info(f"Event '{event_name}' published to RabbitMQ successfully with key '{routing_key}'")
     except Exception as e:
-        logger.error(f"Failed to publish event to RabbitMQ: {e}")
+        logger.error(f"Failed to publish event to RabbitMQ: {e}", exc_info=True)
 
 
 # ============================================
@@ -201,10 +208,10 @@ def publish_event(payload: dict):
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
     """
-    Upload a photo: allocate -> append to all stores -> commit -> similarity indexing
+    Upload a photo: allocate -> append to all stores -> commit -> publish event for similarity indexing
     """
     logger.info(f"[UPLOAD] Starting upload for file: {file.filename}")
-    
+
     try:
         data = await file.read()
         size = len(data)
@@ -213,7 +220,7 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
         # 1) Locate Primary Directory via Discovery Service
         directory_leader_url = await _get_directory_leader_url()
         logger.info(f"[UPLOAD] Step 1: Directory leader selected: {directory_leader_url}")
-        
+
         # 2) Allocate from Directory Primary
         logger.info(f"[UPLOAD] Step 2: Calling allocate_write on {directory_leader_url}")
         async with httpx.AsyncClient() as client:
@@ -222,7 +229,7 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
                 json={"size": size, "alt_key": alt_key},
                 timeout=10.0
             )
-        
+
         if r.status_code != 200:
             logger.error(f"[UPLOAD] allocate_write failed: {r.status_code} - {r.text}")
             raise HTTPException(status_code=500, detail=f"allocate_write failed: {r.text}")
@@ -232,7 +239,7 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
         logical_volume = alloc["logical_volume"]
         cookie = alloc["cookie"]
         replicas = alloc["replicas"]
-        
+
         logger.info(f"[UPLOAD] Step 2 Complete: photo_id={photo_id}, lv={logical_volume}, replicas={replicas}")
 
         headers = {
@@ -244,11 +251,11 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
         # 3) Append synchronously to ALL stores
         logger.info(f"[UPLOAD] Step 3: Appending to {len(replicas)} store(s)")
         failed: List[str] = []
-        
+
         for idx, store in enumerate(replicas):
             store_url = make_store_url(store)
             logger.info(f"[UPLOAD] Step 3.{idx+1}/{len(replicas)}: Appending to {store} at {store_url}")
-            
+
             try:
                 async with httpx.AsyncClient() as sclient:
                     r2 = await sclient.post(
@@ -257,13 +264,13 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
                         headers=headers,
                         timeout=30.0
                     )
-                
+
                 if r2.status_code != 200:
                     logger.error(f"[UPLOAD] Store {store} append failed: {r2.status_code} - {r2.text}")
                     failed.append(store)
                 else:
                     logger.info(f"[UPLOAD] Store {store} append successful")
-                    
+
             except Exception as e:
                 logger.error(f"[UPLOAD] Exception with store {store}: {e}")
                 failed.append(store)
@@ -289,35 +296,13 @@ async def upload(file: UploadFile = File(...), alt_key: Optional[str] = "orig"):
 
         logger.info(f"[UPLOAD] Step 4 Complete: Write committed successfully")
 
-        # 5) Upload to Similarity Service
-        logger.info(f"[UPLOAD] Step 5: Submitting to similarity service")
-        try:
-            async with httpx.AsyncClient() as client:
-                form_data = {'photo_id': str(photo_id)}
-                file_data = {'file': (file.filename, data, file.content_type)}
-                
-                r_sim = await client.post(
-                    f"{SIMILARITY_URL}/upload/",
-                    data=form_data,
-                    files=file_data,
-                    timeout=30.0
-                )
-                
-                if r_sim.status_code == 200:
-                    logger.info(f"[UPLOAD] Step 5 Complete: Photo {photo_id} submitted to similarity service")
-                else:
-                    logger.warning(f"[UPLOAD] Similarity service returned {r_sim.status_code}: {r_sim.text}")
-        except Exception as e:
-            logger.error(f"[UPLOAD] Failed to submit to similarity service: {e}")
-
-        # 6) Publish event
-        logger.info(f"[UPLOAD] Step 6: Publishing event")
+        # 5) MODIFIED: Publish event for asynchronous similarity indexing (replaces direct HTTP call)
+        logger.info(f"[UPLOAD] Step 5: Publishing 'photo.uploaded' event for async indexing by workers")
         publish_event({
             "event": "photo.uploaded",
-            "photo_id": photo_id,
-            "logical_volume": logical_volume,
-            "replicas": replicas
+            "photo_id": photo_id
         })
+        logger.info(f"[UPLOAD] Step 5 Complete: Event published.")
 
         logger.info(f"[UPLOAD] SUCCESS: photo_id={photo_id}")
         return {"photo_id": photo_id, "logical_volume": logical_volume}
@@ -339,29 +324,29 @@ async def serve_photo(photo_id: int):
     Read a photo: lookup directory -> cache lookup -> store read
     """
     logger.info(f"[READ] Starting read for photo_id={photo_id}")
-    
+
     try:
         # 1) Lookup Directory Read URL
         logger.info(f"[READ] Step 1: Querying Directory for metadata")
         directory_read_url = await _get_directory_read_url()
-        
+
         # 2) Lookup metadata from Directory
         async with httpx.AsyncClient() as client:
             r = await client.get(f"{directory_read_url}/photo/{photo_id}")
-        
+
         if r.status_code != 200:
             logger.error(f"[READ] Photo {photo_id} not found in Directory: {r.status_code}")
             raise HTTPException(status_code=404, detail="photo not found")
 
         meta = r.json()
-        
+
         if meta["status"] != "active":
             logger.error(f"[READ] Photo {photo_id} is not active, status={meta['status']}")
             raise HTTPException(status_code=410, detail="photo deleted")
 
         logical_volume = meta["logical_volume"]
         replicas = meta["replicas"]
-        
+
         logger.info(f"[READ] Step 1 Complete: lv={logical_volume}, replicas={replicas}")
 
         # 3) Cache lookup
@@ -382,7 +367,7 @@ async def serve_photo(photo_id: int):
         for idx, store in enumerate(replicas):
             store_url = make_store_url(store)
             logger.info(f"[READ] Step 3.{idx+1}/{len(replicas)}: Trying store {store} at {store_url}")
-            
+
             try:
                 async with httpx.AsyncClient() as sclient:
                     resp = await sclient.get(
@@ -390,10 +375,10 @@ async def serve_photo(photo_id: int):
                         params={"photo_id": photo_id},
                         timeout=10.0
                     )
-                
+
                 if resp.status_code == 200:
                     logger.info(f"[READ] Step 3 Complete: Store {store} HIT")
-                    
+
                     # Store in cache (best effort)
                     try:
                         async with httpx.AsyncClient() as cclient:
@@ -431,17 +416,17 @@ async def delete_photo(photo_id: int):
     Delete a photo: directory soft-delete -> delete from all stores -> cache purge
     """
     logger.info(f"[DELETE] Starting delete for photo_id={photo_id}")
-    
+
     try:
         # 1) Locate Primary Directory
         logger.info(f"[DELETE] Step 1: Querying Discovery for Directory leader")
         directory_leader_url = await _get_directory_leader_url()
-        
+
         # 2) Directory lookup
         logger.info(f"[DELETE] Step 2: Fetching metadata from Directory")
         async with httpx.AsyncClient() as dclient:
             r = await dclient.get(f"{directory_leader_url}/photo/{photo_id}")
-        
+
         if r.status_code != 200:
             logger.error(f"[DELETE] Photo {photo_id} not found")
             raise HTTPException(status_code=404, detail="photo not found")
@@ -449,14 +434,14 @@ async def delete_photo(photo_id: int):
         meta = r.json()
         logical_volume = meta["logical_volume"]
         replicas = meta["replicas"]
-        
+
         logger.info(f"[DELETE] Step 2 Complete: lv={logical_volume}, replicas={replicas}")
 
         # 3) Mark deleted in Directory Primary
         logger.info(f"[DELETE] Step 3: Marking photo as deleted in Directory")
         async with httpx.AsyncClient() as pclient:
             rd = await pclient.post(f"{directory_leader_url}/delete", json={"photo_id": photo_id})
-        
+
         if rd.status_code != 200:
             logger.error(f"[DELETE] Directory delete failed: {rd.status_code}")
             raise HTTPException(status_code=500, detail="directory delete failed")
@@ -466,11 +451,11 @@ async def delete_photo(photo_id: int):
         # 4) Delete from ALL stores (Best effort)
         logger.info(f"[DELETE] Step 4: Deleting from {len(replicas)} store(s)")
         failed: List[str] = []
-        
+
         for idx, store in enumerate(replicas):
             store_url = make_store_url(store)
             logger.info(f"[DELETE] Step 4.{idx+1}/{len(replicas)}: Deleting from {store}")
-            
+
             try:
                 async with httpx.AsyncClient() as sclient:
                     r2 = await sclient.post(
@@ -478,7 +463,7 @@ async def delete_photo(photo_id: int):
                         json={"photo_id": photo_id},
                         timeout=5.0
                     )
-                
+
                 if r2.status_code != 200:
                     logger.warning(f"[DELETE] Store {store} delete failed: {r2.status_code}")
                     failed.append(store)
@@ -516,10 +501,10 @@ async def delete_photo(photo_id: int):
 @app.post("/find_similar")
 async def find_similar(file: UploadFile = File(...), k: int = Form(5)):
     """
-    Find similar photos: forward to similarity service
+    Find similar photos: forward to similarity service master
     """
     logger.info(f"[FIND_SIMILAR] Starting search for {file.filename} with k={k}")
-    
+
     try:
         # 1. Read file content
         logger.info(f"[FIND_SIMILAR] Step 1: Reading query file")
@@ -529,20 +514,21 @@ async def find_similar(file: UploadFile = File(...), k: int = Form(5)):
         except Exception as e:
             logger.error(f"[FIND_SIMILAR] Failed to read file: {e}")
             raise HTTPException(status_code=500, detail="Failed to read query file content.")
-        
-        # 2. Send to similarity service
-        logger.info(f"[FIND_SIMILAR] Step 2: Forwarding to similarity service")
+
+        # 2. Send to similarity service (Master)
+        logger.info(f"[FIND_SIMILAR] Step 2: Forwarding to similarity service master at {SIMILARITY_URL}")
         async with httpx.AsyncClient() as client:
             form_data = {'k': str(k)}
             files = {'file': (file.filename, content, file.content_type)}
-            
+
+            # The new service might have a different endpoint name, adjust if needed. Assuming /find_similar/
             r_sim = await client.post(
                 f"{SIMILARITY_URL}/find_similar/",
                 data=form_data,
                 files=files,
                 timeout=60.0
             )
-            
+
             if r_sim.status_code == 200:
                 logger.info(f"[FIND_SIMILAR] SUCCESS: Received results from similarity service")
                 return r_sim.json()

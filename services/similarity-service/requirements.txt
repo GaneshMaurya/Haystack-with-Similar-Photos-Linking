@@ -1,0 +1,9 @@
+fastapi
+uvicorn
+pika
+httpx
+numpy<2       
+pillow
+torch
+torchvision
+faiss-cpu
